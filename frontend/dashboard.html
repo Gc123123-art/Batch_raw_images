@@ -1,0 +1,1076 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>工作台 — BOLI AI 批量生图</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+  <nav class="navbar">
+    <div class="container navbar-inner">
+      <div class="navbar-logo">BOLI AI</div>
+      <div class="navbar-right">
+        <div class="balance-pill" id="balancePill">
+          <span class="dot"></span>
+          <span>余额 <strong id="balanceValue">--</strong> 次</span>
+        </div>
+        <div class="user-menu" id="userMenu">
+          <span class="user-avatar" id="userAvatar">?</span>
+          <span id="userName">--</span>
+        </div>
+        <button class="btn btn-ghost" id="logoutBtn" style="padding:6px 12px;font-size:12px;">退出登录</button>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container">
+    <div class="studio-header">
+      <div>
+        <h1 class="studio-title">在线生图</h1>
+        <div class="studio-subtitle">GPT · NANO BANANA IMAGE STUDIO</div>
+      </div>
+    </div>
+
+    <div class="studio">
+      <!-- 左侧：输入区 -->
+      <aside class="studio-left card">
+        <form id="createForm">
+          <!-- 提示词 -->
+          <div class="field">
+            <textarea id="prompt" class="input prompt-input" placeholder="窗外的风景再加点雪，架子上的书不要这么整齐" required></textarea>
+          </div>
+
+          <!-- 参考图区 -->
+          <div id="uploadSection" class="field">
+            <div class="field-label"><i data-lucide="image" class="lucide-icon"></i> 参考图片</div>
+            <div style="font-size:11px;color:var(--text-tertiary);margin-bottom:6px;">上传图片即图生图；上传 ZIP/RAR 或整个文件夹即批量生成（每张图独立生成 1 张）。批量模式下还可另加共用参考图（如衣服），会附加到每张批量图一起编辑</div>
+            <div class="ref-list" id="refList">
+              <!-- 动态渲染的缩略图 + + 按钮 -->
+              <div class="drop-hint">
+                <i data-lucide="upload-cloud" class="lucide-icon"></i>
+                <span>松开鼠标上传</span>
+              </div>
+            </div>
+            <input type="file" id="fileInput" hidden multiple accept="image/*,.zip,.rar">
+            <input type="file" id="folderInput" hidden webkitdirectory directory multiple>
+          </div>
+
+          <!-- 比例 + 张数 -->
+          <div class="field-row">
+            <div class="field">
+              <div class="field-label"><i data-lucide="maximize" class="lucide-icon"></i> 比例</div>
+              <div class="input-wrap">
+                <select id="ratio" class="input">
+                  <option value="1:1" selected>1:1 正方形</option>
+                  <option value="3:4">3:4 竖版</option>
+                  <option value="4:3">4:3 横版</option>
+                  <option value="9:16">9:16 竖版</option>
+                  <option value="16:9">16:9 横版</option>
+                  <option value="2:3">2:3 竖版</option>
+                  <option value="3:2">3:2 横版</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <div class="field-label"><i data-lucide="layers" class="lucide-icon"></i> 张数</div>
+              <div class="qty-control">
+                <button type="button" class="qty-btn" id="qtyMinus">−</button>
+                <input type="number" id="n" class="qty-input" value="1" min="1" max="4">
+                <button type="button" class="qty-btn" id="qtyPlus">+</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 生成按钮 -->
+          <button type="submit" class="btn btn-generate" id="submitBtn">
+            <i data-lucide="sparkles" class="lucide-icon"></i> 生 成
+          </button>
+
+          <div class="cost-hint" id="costHint" style="margin-top:10px;">
+            <span>预计消耗</span>
+            <span class="cost-value" id="costValue">1 次</span>
+          </div>
+        </form>
+      </aside>
+
+      <!-- 右侧：当前大图预览 -->
+      <section class="studio-right">
+        <div class="preview-card card" id="previewCard">
+          <div class="preview-empty" id="previewEmpty">
+            <i data-lucide="image" class="lucide-icon lucide-xl" style="opacity:0.3;display:block;margin:0 auto 12px;"></i>
+            <div style="color:var(--text-tertiary);">填写左侧提示词后点击「生成」</div>
+            <div style="color:var(--text-tertiary);font-size:12px;margin-top:6px;">生成结果将在这里显示</div>
+          </div>
+          <img id="previewImg" class="preview-img" style="display:none;" alt="">
+          <div class="preview-loading" id="previewLoading" style="display:none;">
+            <div class="spinner"></div>
+            <div style="margin-top:12px;color:var(--text-secondary);">正在生成中…</div>
+          </div>
+          <div class="preview-failed" id="previewFailed" style="display:none;">
+            <i data-lucide="alert-circle" class="lucide-icon lucide-xl" style="color:var(--danger,#ef4444);display:block;margin:0 auto 12px;"></i>
+            <div style="color:var(--text-primary);font-weight:600;">生成失败</div>
+            <div id="previewFailedMsg" style="color:var(--text-tertiary);font-size:12px;margin-top:8px;line-height:1.5;max-width:360px;word-break:break-all;"></div>
+            <div style="color:var(--text-tertiary);font-size:12px;margin-top:12px;">已自动退还本次额度，可修改提示词或参考图后重新生成</div>
+          </div>
+          <div class="preview-actions" id="previewActions" style="display:none;">
+            <button class="preview-action" id="previewDownload" title="多图时打包下载全部">
+              <i data-lucide="download" class="lucide-icon"></i>
+            </button>
+          </div>
+          <button class="preview-nav preview-nav-prev" id="previewPrev" title="上一张（←）" style="display:none;">‹</button>
+          <button class="preview-nav preview-nav-next" id="previewNext" title="下一张（→）" style="display:none;">›</button>
+          <div class="preview-meta" id="previewMeta" style="display:none;">
+            <span id="previewSize">--</span>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- 下方：历史任务列表 -->
+    <div class="section-title" style="margin: 32px 0 16px;">
+      <span>历史任务</span>
+      <span class="count" id="taskCount">0 个</span>
+    </div>
+    <div class="task-list" id="taskList">
+      <div class="card empty">
+        <i data-lucide="grid-3x3" class="lucide-icon lucide-xl" style="margin:0 auto 12px;opacity:0.4;display:block;"></i>
+        <div>还没有任务，去上方创建第一个吧 →</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 参考图放大查看 -->
+  <div class="modal" id="refModal" style="display:none;">
+    <button class="modal-close" id="refModalClose">×</button>
+    <img id="refModalImg" src="" alt="" draggable="false">
+    <div class="modal-hint">滚轮缩放 · 双击放大 · 拖动查看 · ESC 关闭</div>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/auth.js"></script>
+  <script>
+    if (!auth.requireLogin()) throw new Error('未登录');
+
+    // ========== DOM ==========
+    const balanceValue = document.getElementById('balanceValue');
+    const userName = document.getElementById('userName');
+    const userAvatar = document.getElementById('userAvatar');
+    const logoutBtn = document.getElementById('logoutBtn');
+    const taskList = document.getElementById('taskList');
+    const taskCount = document.getElementById('taskCount');
+
+    const uploadSection = document.getElementById('uploadSection');
+    const refList = document.getElementById('refList');
+    const fileInput = document.getElementById('fileInput');
+    const folderInput = document.getElementById('folderInput');
+
+    const createForm = document.getElementById('createForm');
+    const submitBtn = document.getElementById('submitBtn');
+    const costValue = document.getElementById('costValue');
+    const nInput = document.getElementById('n');
+    const ratioSelect = document.getElementById('ratio');
+
+    const previewEmpty = document.getElementById('previewEmpty');
+    const previewImg = document.getElementById('previewImg');
+    const previewLoading = document.getElementById('previewLoading');
+    const previewFailed = document.getElementById('previewFailed');
+    const previewFailedMsg = document.getElementById('previewFailedMsg');
+    const previewActions = document.getElementById('previewActions');
+    const previewMeta = document.getElementById('previewMeta');
+    const previewSize = document.getElementById('previewSize');
+    const previewDownload = document.getElementById('previewDownload');
+    const previewPrev = document.getElementById('previewPrev');
+    const previewNext = document.getElementById('previewNext');
+
+    // ========== 参考图放大查看 ==========
+    const refModal = document.getElementById('refModal');
+    const refModalImg = document.getElementById('refModalImg');
+    const refModalClose = document.getElementById('refModalClose');
+    let rScale = 1, rTx = 0, rTy = 0, rDragging = false, rStartX = 0, rStartY = 0, rOrigTx = 0, rOrigTy = 0;
+    function rApplyTransform() {
+      refModalImg.style.transform = `translate(${rTx}px, ${rTy}px) scale(${rScale})`;
+      refModalImg.style.cursor = rScale > 1 ? (rDragging ? 'grabbing' : 'grab') : 'zoom-in';
+    }
+    function rResetTransform() { rScale = 1; rTx = 0; rTy = 0; rApplyTransform(); }
+    function openRefModal(url) {
+      refModalImg.src = url;
+      rResetTransform();
+      refModal.style.display = 'flex';
+    }
+    function closeRefModal() { refModal.style.display = 'none'; rResetTransform(); }
+    refModalClose.addEventListener('click', closeRefModal);
+    refModal.addEventListener('click', (e) => { if (e.target === refModal) closeRefModal(); });
+    refModalImg.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? -0.15 : 0.15;
+      rScale = Math.min(8, Math.max(0.2, rScale + delta));
+      rApplyTransform();
+    }, { passive: false });
+    refModalImg.addEventListener('mousedown', (e) => {
+      if (rScale <= 1) return;
+      rDragging = true;
+      rStartX = e.clientX; rStartY = e.clientY;
+      rOrigTx = rTx; rOrigTy = rTy;
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!rDragging) return;
+      rTx = rOrigTx + (e.clientX - rStartX);
+      rTy = rOrigTy + (e.clientY - rStartY);
+      rApplyTransform();
+    });
+    window.addEventListener('mouseup', () => { if (rDragging) { rDragging = false; rApplyTransform(); } });
+    refModalImg.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      if (rScale > 1) { rResetTransform(); } else { rScale = 2; rApplyTransform(); }
+    });
+    document.addEventListener('keydown', (e) => {
+      if (refModal.style.display === 'flex' && e.key === 'Escape') closeRefModal();
+    });
+    // 点击参考图缩略图放大（事件委托，renderRefs 重渲染后依然有效）
+    refList.addEventListener('click', (e) => {
+      if (e.target.closest('.ref-remove')) return;
+      const thumb = e.target.closest('.ref-thumb[data-i]');
+      if (!thumb) return;
+      const item = refItems[parseInt(thumb.dataset.i)];
+      if (item) openRefModal(absUrl(item.url));
+    });
+
+    // ========== 状态 ==========
+    // refItems：参考图。普通模式下直接作为图生图参考；批量模式下作为"共用参考图"
+    // 附加到每张批量图后面一起送模型（如：批量图是老人+护工，共用参考图是两件衣服）
+    let refItems = [];  // [{ path, url, name }]
+    // batchSource：批量图来源（ZIP/RAR 压缩包或整个文件夹），每张批量图独立生成 1 张
+    let batchSource = null;  // { name, count, paths, kind: 'zip' | 'folder' }
+    const MAX_REFS = 6;         // 普通模式参考图上限
+    const MAX_BATCH_REFS = 5;   // 批量模式共用参考图上限（1 张批量图 + 5 张共用 = 6）
+    const MAX_BATCH_IMAGES = 100;  // 压缩包/文件夹批量上限
+    const IMAGE_RE = /\.(png|jpe?g|webp|bmp|gif)$/i;
+    function maxRefs() { return batchSource ? MAX_BATCH_REFS : MAX_REFS; }
+
+    // ========== 用户信息 ==========
+    async function loadUser() {
+      const u = await auth.loadProfile();
+      balanceValue.textContent = u.balance;
+      userName.textContent = u.account;
+      userAvatar.textContent = firstChar(u.account);
+    }
+
+    // ========== 任务列表 ==========
+    async function loadTasks() {
+      try {
+        const resp = await api.listTasks();
+        const tasks = resp.tasks || resp || [];
+        taskCount.textContent = `${tasks.length} 个`;
+        if (tasks.length === 0) {
+          taskList.innerHTML = `
+            <div class="card empty">
+              <i data-lucide="grid-3x3" class="lucide-icon lucide-xl" style="margin:0 auto 12px;opacity:0.4;display:block;"></i>
+              <div>还没有任务，去上方创建第一个吧 →</div>
+            </div>`;
+          if (window.lucide) lucide.createIcons();
+          return;
+        }
+        taskList.innerHTML = tasks.map(t => {
+          const pct = t.total_count > 0 ? (t.completed_count / t.total_count * 100) : 0;
+          return `
+            <div class="task-item fade-in" data-id="${t.id}">
+              <div class="task-prompt">${escapeHtml(t.prompt)}</div>
+              <div class="task-progress">
+                <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+                <span style="font-size:11px;color:var(--text-tertiary);min-width:42px;">${t.completed_count}/${t.total_count}</span>
+              </div>
+              <span class="status-badge status-${t.status}">${statusText(t.status)}</span>
+            </div>`;
+        }).join('');
+        if (window.lucide) lucide.createIcons();
+        taskList.querySelectorAll('.task-item').forEach(el => {
+          el.addEventListener('click', () => {
+            location.href = `task-detail.html?id=${el.dataset.id}`;
+          });
+        });
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    }
+
+    // ========== 参考图缩略图渲染 ==========
+    // 渲染上传的图时，url 字段是相对路径，转换成绝对 URL
+    // 后端已生成短时效签名 URL（不暴露登录 token），这里仅拼接 API 地址
+    function absUrl(u) {
+      if (!u) return '';
+      if (u.startsWith('http://') || u.startsWith('https://') || u.startsWith('data:')) return u;
+      if (u.startsWith('//')) return 'http:' + u;
+      const base = API_BASE;  // config.js 全局常量，支持同源反代（空字符串）
+      return base + (u.startsWith('/') ? u : '/' + u);
+    }
+    function renderRefs() {
+      // 提取并保留 drop-hint（拖拽时显示的覆盖层）
+      const dropHint = refList.querySelector('.drop-hint');
+
+      const thumbItems = (list) => list.map((it, i) => `
+          <div class="ref-thumb" draggable="true" data-i="${i}">
+            <img src="${absUrl(it.url)}" alt="" draggable="false">
+            <button class="ref-remove" data-i="${i}" title="删除">×</button>
+          </div>
+        `).join('');
+
+      if (batchSource) {
+        // 批量模式：批量来源卡片（占整行）+ 共用参考图行
+        const isFolder = batchSource.kind === 'folder';
+        refList.innerHTML = `
+          <div class="ref-thumb batch-source-card">
+            <div class="batch-source-inner">
+              <i data-lucide="${isFolder ? 'folder-open' : 'archive'}" style="width:26px;height:26px;color:var(--accent-blue);flex-shrink:0;"></i>
+              <div class="batch-source-text">
+                <div class="batch-source-name">${escapeHtml(batchSource.name)}</div>
+                <div class="batch-source-count">${isFolder ? '文件夹' : '压缩包'} · ${batchSource.count} 张图片 · 每张独立生成 1 张</div>
+              </div>
+            </div>
+            <button class="ref-remove" data-zip="1" title="删除">×</button>
+          </div>
+          <div class="batch-divider"><span>共用参考图 · 附加到每张批量图（≤${MAX_BATCH_REFS} 张）</span></div>
+          ${refItems.length > 0 ? thumbItems(refItems) : ''}
+          ${refItems.length < MAX_BATCH_REFS ? `
+          <div class="ref-add" id="refAdd" title="添加共用参考图">
+            <i data-lucide="plus" class="lucide-icon"></i>
+          </div>` : ''}`;
+      } else if (refItems.length === 0) {
+        // 无图：单一上传入口（点击选图片/ZIP/RAR；文件夹拖入即可）
+        refList.innerHTML = `
+          <div class="ref-add ref-add-empty" id="refAdd">
+            <i data-lucide="plus" class="lucide-icon"></i>
+            <span class="ref-add-hint">点击或拖入图片 / ZIP / RAR / 文件夹（≤6 张）</span>
+          </div>`;
+      } else {
+        // 普通模式：参考图缩略图 + 添加 + 文件夹入口
+        const addBtn = refItems.length < MAX_REFS ? `
+          <div class="ref-add" id="refAdd">
+            <i data-lucide="plus" class="lucide-icon"></i>
+          </div>` : '';
+        refList.innerHTML = thumbItems(refItems) + addBtn + `
+          <div class="ref-add" id="folderAdd" title="选择文件夹批量生成">
+            <i data-lucide="folder-open" class="lucide-icon"></i>
+          </div>`;
+      }
+      if (dropHint) refList.appendChild(dropHint);
+      if (window.lucide) lucide.createIcons();
+      // 绑定事件
+      const addEl = document.getElementById('refAdd');
+      if (addEl) addEl.addEventListener('click', () => fileInput.click());
+      const folderEl = document.getElementById('folderAdd');
+      if (folderEl) folderEl.addEventListener('click', (e) => {
+        // 阻止冒泡到 refAdd（否则会同时打开文件选择框）
+        e.stopPropagation();
+        folderInput.click();
+      });
+      refList.querySelectorAll('.ref-remove[data-zip]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeBatchSource();
+        });
+      });
+      refList.querySelectorAll('.ref-remove[data-i]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const i = parseInt(btn.dataset.i);
+          const removed = refItems[i];
+          refItems.splice(i, 1);
+          // 通知后端立即删除该文件（失败忽略，由后端兜底清扫）
+          if (removed && removed.path) api.deleteUpload(removed.path).catch(() => {});
+          renderRefs();
+        });
+      });
+    }
+
+    // ========== 文件上传 ==========
+    // 移除批量来源（ZIP/RAR/文件夹）：删服务端文件 + 恢复普通模式
+    function removeBatchSource() {
+      const old = batchSource;
+      batchSource = null;
+      syncBatchModeUI();
+      renderRefs();
+      // 通知后端删除批量图文件（失败忽略，由后端兜底清扫）
+      if (old && old.paths) old.paths.forEach(p => api.deleteUpload(p).catch(() => {}));
+    }
+
+    // 设置批量来源：替换旧来源 + 共用参考图上限收缩到 5（1 批量图 + 5 共用 = 6）
+    function setBatchSource(src) {
+      if (batchSource && batchSource.paths) {
+        batchSource.paths.forEach(p => api.deleteUpload(p).catch(() => {}));
+      }
+      batchSource = src;
+      while (refItems.length > MAX_BATCH_REFS) {
+        const removed = refItems.pop();
+        if (removed && removed.path) api.deleteUpload(removed.path).catch(() => {});
+      }
+      syncBatchModeUI();
+      renderRefs();
+      const extra = refItems.length > 0 ? `，已附带 ${refItems.length} 张共用参考图` : '';
+      toast(`已添加${src.kind === 'folder' ? '文件夹' : '压缩包'}（${src.count} 张图片）${extra}`, 'success');
+    }
+
+    // 上传 ZIP/RAR 压缩包（后端解压并返回图片列表）
+    async function uploadZipBatch(file) {
+      toast('正在解压并上传…', 'info');
+      const res = await api.uploadZip(file);
+      const serverFiles = res.files || [];
+      if (serverFiles.length === 0) { toast('压缩包内没有图片', 'error'); return; }
+      const count = Math.min(serverFiles.length, MAX_BATCH_IMAGES);
+      if (serverFiles.length > MAX_BATCH_IMAGES) {
+        toast(`压缩包内图片过多，仅保留前 ${MAX_BATCH_IMAGES} 张`, 'info');
+      }
+      setBatchSource({
+        name: file.name, count, kind: 'zip',
+        paths: serverFiles.slice(0, count).map(f => f.path),
+      });
+    }
+
+    // 上传文件夹内的图片（逐张走普通上传接口）
+    async function uploadFolderBatch(files, folderName) {
+      const imgFiles = files.filter(f => IMAGE_RE.test(f.name));
+      if (imgFiles.length === 0) { toast('文件夹内没有图片', 'error'); return; }
+      const capped = imgFiles.slice(0, MAX_BATCH_IMAGES);
+      if (imgFiles.length > MAX_BATCH_IMAGES) {
+        toast(`文件夹内图片过多，仅保留前 ${MAX_BATCH_IMAGES} 张`, 'info');
+      }
+      toast(`正在上传文件夹图片（共 ${capped.length} 张）…`, 'info');
+      const paths = [];
+      try {
+        for (const f of capped) {
+          const res = await api.upload(f);
+          paths.push(res.path);
+        }
+      } catch (err) {
+        // 中途失败：清掉已上传的，避免残留
+        paths.forEach(p => api.deleteUpload(p).catch(() => {}));
+        toast('上传失败：' + err.message, 'error');
+        return;
+      }
+      setBatchSource({ name: folderName || '文件夹', count: paths.length, paths, kind: 'folder' });
+    }
+
+    // 递归读取拖入的目录/文件 entry，收集图片 File（仅图片扩展名）
+    async function collectEntryFiles(entry, out) {
+      if (entry.isFile) {
+        if (!IMAGE_RE.test(entry.name)) return;
+        const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+        out.push(file);
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        // readEntries 单次最多返回 100 条，循环读到空为止
+        while (true) {
+          const children = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+          if (children.length === 0) break;
+          for (const child of children) await collectEntryFiles(child, out);
+        }
+      }
+    }
+
+    fileInput.addEventListener('change', async () => {
+      const files = Array.from(fileInput.files || []);
+      fileInput.value = '';
+      if (files.length === 0) return;
+      try {
+        // 压缩包：进入批量模式（多选时只取第一个压缩包）
+        const zipFile = files.find(f => /\.(zip|rar)$/i.test(f.name));
+        if (zipFile) {
+          await uploadZipBatch(zipFile);
+          return;
+        }
+        // 普通图片：加入参考图（批量模式下为共用参考图）
+        let added = 0;
+        for (const file of files) {
+          if (file.type && !file.type.startsWith('image/') && !IMAGE_RE.test(file.name)) continue;
+          if (refItems.length >= maxRefs()) {
+            toast(`最多上传 ${maxRefs()} 张参考图`, 'error');
+            break;
+          }
+          try {
+            const res = await api.upload(file);
+            refItems.push({ path: res.path, url: res.url, name: file.name });
+            added++;
+          } catch (err) {
+            toast('上传失败：' + file.name + '：' + err.message, 'error');
+          }
+        }
+        if (added > 0) {
+          toast(`已添加 ${added} 张参考图`, 'success');
+          syncBatchModeUI();
+        }
+        renderRefs();
+      } catch (err) {
+        toast('上传失败：' + err.message, 'error');
+      }
+    });
+
+    // 文件夹选择（webkitdirectory）：整夹图片作为批量来源
+    folderInput.addEventListener('change', async () => {
+      const files = Array.from(folderInput.files || []);
+      folderInput.value = '';
+      if (files.length === 0) return;
+      const rel = files[0].webkitRelativePath || files[0].name || '';
+      const folderName = rel.includes('/') ? rel.split('/')[0] : '';
+      try {
+        await uploadFolderBatch(files, folderName);
+      } catch (err) {
+        toast('上传失败：' + err.message, 'error');
+      }
+    });
+
+    // ========== 参考图重排（拖动调换位置） ==========
+    // 缩略图 draggable=true，拖动时通过 reorderState 追踪源 index
+    // 拖到目标缩略图的左/右半边时显示插入位置指示线
+    let reorderState = null;  // { fromIndex }
+
+    function clearReorderHints() {
+      refList.querySelectorAll('.ref-thumb').forEach(el => {
+        el.classList.remove('drop-before', 'drop-after', 'draggable-source');
+      });
+    }
+    // 缩略图自身：dragstart 记录源 index；dragend 清理状态
+    refList.addEventListener('dragstart', (e) => {
+      const thumb = e.target.closest('.ref-thumb[data-i]');
+      if (!thumb) return;
+      const fromIndex = parseInt(thumb.dataset.i);
+      reorderState = { fromIndex };
+      // 设置拖拽数据（必须设值才允许拖动；类型用 'application/x-ref-reorder' 避免与文件拖拽冲突）
+      try {
+        e.dataTransfer.setData('application/x-ref-reorder', String(fromIndex));
+        e.dataTransfer.effectAllowed = 'move';
+      } catch (_) { /* 部分浏览器 setData 会抛错，忽略 */ }
+      // 视觉：源缩略图半透明
+      requestAnimationFrame(() => thumb.setAttribute('draggable-source', ''));
+    });
+    refList.addEventListener('dragend', (e) => {
+      const thumb = e.target.closest('.ref-thumb[data-i]');
+      if (thumb) thumb.removeAttribute('draggable-source');
+      clearReorderHints();
+      reorderState = null;
+    });
+
+    // 缩略图自身：dragover/dragleave 计算插入位置（左/右半边）
+    refList.addEventListener('dragover', (e) => {
+      if (!reorderState) return;  // 文件拖拽走另一条逻辑
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const thumb = e.target.closest('.ref-thumb[data-i]');
+      if (!thumb) { clearReorderHints(); return; }
+      const targetIndex = parseInt(thumb.dataset.i);
+      if (targetIndex === reorderState.fromIndex) {
+        thumb.classList.remove('drop-before', 'drop-after');
+        return;
+      }
+      const rect = thumb.getBoundingClientRect();
+      const isBefore = (e.clientX - rect.left) < rect.width / 2;
+      // 清除所有指示线
+      refList.querySelectorAll('.ref-thumb').forEach(el => {
+        el.classList.remove('drop-before', 'drop-after');
+      });
+      thumb.classList.add(isBefore ? 'drop-before' : 'drop-after');
+    });
+    refList.addEventListener('dragleave', (e) => {
+      if (!reorderState) return;
+      // 仅当离开 refList 区域才清除
+      if (!refList.contains(e.relatedTarget)) clearReorderHints();
+    });
+
+    // 缩略图自身：drop 实际调整顺序
+    refList.addEventListener('drop', (e) => {
+      if (!reorderState) return;  // 文件拖拽走另一条逻辑
+      e.preventDefault();
+      e.stopPropagation();  // 阻止冒泡到 refList 的文件 drop 监听
+      const thumb = e.target.closest('.ref-thumb[data-i]');
+      if (!thumb) {
+        clearReorderHints();
+        reorderState = null;
+        return;
+      }
+      const targetIndex = parseInt(thumb.dataset.i);
+      const fromIndex = reorderState.fromIndex;
+      const rect = thumb.getBoundingClientRect();
+      const isBefore = (e.clientX - rect.left) < rect.width / 2;
+      clearReorderHints();
+      // 计算插入位置
+      let toIndex = isBefore ? targetIndex : targetIndex + 1;
+      if (fromIndex < toIndex) toIndex -= 1;
+      if (fromIndex !== toIndex) {
+        const [moved] = refItems.splice(fromIndex, 1);
+        refItems.splice(toIndex, 0, moved);
+        renderRefs();
+        toast('已调整参考图顺序', 'success');
+      }
+      reorderState = null;
+    });
+
+    // ========== 拖拽图片到参考图区域 ==========
+    // drop zone 聚焦在 ref-list 本身（覆盖缩略图 + + 按钮），视觉反馈更强
+    let dragCounter = 0;
+    function isFileDrag(e) {
+      // 仅对外部文件拖拽生效，不影响页面内元素拖拽
+      return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+    }
+    refList.addEventListener('dragenter', (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      dragCounter++;
+      if (dragCounter === 1) refList.setAttribute('dragging', '');
+    });
+    refList.addEventListener('dragover', (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    refList.addEventListener('dragleave', (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      dragCounter = Math.max(0, dragCounter - 1);
+      if (dragCounter === 0) refList.removeAttribute('dragging');
+    });
+    refList.addEventListener('drop', async (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      dragCounter = 0;
+      refList.removeAttribute('dragging');
+
+      // 1) 拖入文件夹：webkitGetAsEntry 递归收集图片
+      //    （entry 只能在事件同步阶段获取，先取再 await）
+      const entries = Array.from(e.dataTransfer.items || [])
+        .map(it => (typeof it.webkitGetAsEntry === 'function') ? it.webkitGetAsEntry() : null)
+        .filter(Boolean);
+      const dirEntry = entries.find(en => en.isDirectory);
+      if (dirEntry) {
+        try {
+          const collected = [];
+          for (const en of entries) await collectEntryFiles(en, collected);
+          await uploadFolderBatch(collected, dirEntry.name);
+        } catch (err) {
+          toast('读取文件夹失败：' + (err.message || err), 'error');
+        }
+        return;
+      }
+
+      const dropped = Array.from(e.dataTransfer?.files || []);
+      if (dropped.length === 0) {
+        toast('请拖入图片、文件夹或 ZIP/RAR 文件', 'error');
+        return;
+      }
+
+      // 2) 拖入 ZIP / RAR：批量模式（整体保存）
+      const zipFile = dropped.find(f => /\.(zip|rar)$/i.test(f.name));
+      if (zipFile) {
+        try {
+          await uploadZipBatch(zipFile);
+        } catch (err) {
+          toast('上传失败：' + err.message, 'error');
+        }
+        return;
+      }
+
+      // 3) 拖入普通图片：加入参考图（批量模式下为共用参考图）
+      const imageFiles = dropped.filter(f => f.type.startsWith('image/') || IMAGE_RE.test(f.name));
+      if (imageFiles.length === 0) {
+        toast('请拖入图片、文件夹或 ZIP/RAR 文件', 'error');
+        return;
+      }
+      let added = 0;
+      for (const file of imageFiles) {
+        if (refItems.length >= maxRefs()) {
+          toast(`最多上传 ${maxRefs()} 张参考图`, 'error');
+          break;
+        }
+        try {
+          const res = await api.upload(file);
+          refItems.push({ path: res.path, url: res.url, name: file.name });
+          added++;
+        } catch (err) {
+          toast('上传失败：' + err.message, 'error');
+        }
+      }
+      if (added > 0) {
+        toast(`已添加 ${added} 张参考图`, 'success');
+        syncBatchModeUI();
+      }
+      renderRefs();
+    });
+    // 兜底：拖出整个窗口或异常结束时清理状态
+    document.addEventListener('dragend', () => {
+      dragCounter = 0;
+      refList.removeAttribute('dragging');
+    });
+    window.addEventListener('drop', (e) => {
+      // 阻止浏览器默认行为（打开图片），但只阻止 default
+      e.preventDefault();
+    });
+    window.addEventListener('dragover', (e) => {
+      // 阻止浏览器默认行为，drop 事件才能正常触发
+      e.preventDefault();
+    });
+
+    // ========== 图片粘贴上传 ==========
+    document.getElementById('prompt').addEventListener('paste', async (e) => {
+      const items = e.clipboardData?.items;
+      const files = e.clipboardData?.files;
+      const imageItems = Array.from(items || []).filter(it => it.type.startsWith('image/'));
+      const imageFiles = Array.from(files || []).filter(f => f.type.startsWith('image/'));
+
+      if (imageItems.length === 0 && imageFiles.length === 0) return;
+
+      e.preventDefault();
+
+      // 优先从 items 取文件
+      const sources = imageItems.length > 0
+        ? imageItems.map(it => it.getAsFile()).filter(Boolean)
+        : imageFiles;
+
+      for (const file of sources) {
+        if (refItems.length >= maxRefs()) {
+          toast(`最多上传 ${maxRefs()} 张参考图`, 'error');
+          break;
+        }
+        try {
+          const ext = file.name?.split('.').pop() || 'png';
+          const namedFile = new File([file], `paste_${Date.now()}.${ext}`, { type: file.type });
+          const res = await api.upload(namedFile);
+          refItems.push({ path: res.path, url: res.url, name: namedFile.name });
+          toast('已粘贴 ' + namedFile.name, 'success');
+        } catch (err) {
+          toast('粘贴上传失败：' + err.message, 'error');
+        }
+      }
+      renderRefs();
+    });
+
+    // ========== 数量加减 ==========
+    document.getElementById('qtyPlus').addEventListener('click', () => {
+      const v = parseInt(nInput.value) || 1;
+      nInput.value = Math.min(4, v + 1);
+      updateCost();
+    });
+    document.getElementById('qtyMinus').addEventListener('click', () => {
+      const v = parseInt(nInput.value) || 1;
+      nInput.value = Math.max(1, v - 1);
+      updateCost();
+    });
+    nInput.addEventListener('input', updateCost);
+
+    // 批量模式：禁用"张数"输入框（每张批量图固定生成 1 张）
+    function syncBatchModeUI() {
+      if (batchSource) {
+        nInput.value = 1;
+        nInput.disabled = true;
+        nInput.parentElement.style.opacity = '0.5';
+      } else {
+        nInput.disabled = false;
+        nInput.parentElement.style.opacity = '1';
+      }
+      updateCost();
+    }
+
+    // ========== 计算消耗 ==========
+    function updateCost() {
+      // 批量模式：按批量图数量计费（共用参考图不额外计费，与张数 n 无关）
+      // 单图模式：按 n 计费
+      const n = parseInt(nInput.value) || 1;
+      const cost = batchSource ? batchSource.count : n;
+      costValue.textContent = `${cost} 次`;
+    }
+
+    // ========== 大图预览 ==========
+    // 当前任务多图结果状态：curResults 为成功结果列表（按 seq 升序），curIdx 为当前展示下标
+    let curTaskId = null, curResults = [], curIdx = 0, curTotal = 0;
+
+    function hidePreviewExtras() {
+      previewActions.style.display = 'none';
+      previewMeta.style.display = 'none';
+      previewPrev.style.display = 'none';
+      previewNext.style.display = 'none';
+    }
+    function showPreviewLoading() {
+      previewEmpty.style.display = 'none';
+      previewImg.style.display = 'none';
+      previewFailed.style.display = 'none';
+      hidePreviewExtras();
+      curTaskId = null; curResults = []; curIdx = 0;
+      releasePreviewCache();
+      previewLoading.style.display = 'flex';
+    }
+    // 释放会话内缓存的预览图 blob（新任务开始时调用），避免长时间使用内存膨胀
+    function releasePreviewCache() {
+      previewBlobCache.forEach(p => {
+        Promise.resolve(p).then(url => URL.revokeObjectURL(url)).catch(() => {});
+      });
+      previewBlobCache.clear();
+    }
+    function showPreviewImage(url, sizeText) {
+      previewLoading.style.display = 'none';
+      previewEmpty.style.display = 'none';
+      previewFailed.style.display = 'none';
+      previewImg.src = url;
+      previewImg.style.display = 'block';
+      previewActions.style.display = 'flex';
+      previewMeta.style.display = 'block';
+      if (sizeText) previewSize.textContent = sizeText;
+    }
+    // 展示某次任务的全部成功结果（多图支持左右翻页）
+    async function showTaskResults(taskId, successList, completedCount) {
+      curTaskId = taskId;
+      curResults = successList;
+      curTotal = completedCount;
+      curIdx = 0;
+      await renderCurResult();
+      // 后台预取本次任务剩余图片，保证翻页秒开（不阻塞当前展示）
+      prefetchRestImages();
+    }
+    // 逐张预取未缓存的结果图（fetchPreviewBlob 内部有并发去重）
+    function prefetchRestImages() {
+      if (!curTaskId || !curResults.length) return;
+      curResults.forEach(one => {
+        fetchPreviewBlob(curTaskId, one.seq).catch(() => {});
+      });
+    }
+    async function renderCurResult() {
+      if (!curTaskId || !curResults.length) return;
+      const one = curResults[curIdx];
+      // 该图尚未缓存时淡化当前图，给出加载反馈
+      if (!previewBlobCache.has(`${curTaskId}:${one.seq}`)) previewImg.style.opacity = '0.4';
+      let url;
+      try {
+        url = await fetchPreviewBlob(curTaskId, one.seq);
+      } catch (e) {
+        previewImg.style.opacity = '';
+        console.error('load result image failed', e);
+        return;
+      }
+      previewImg.style.opacity = '';
+      showPreviewImage(url, `结果 ${one.seq}/${curTotal}（${curIdx + 1}/${curResults.length}）`);
+      const multi = curResults.length > 1;
+      previewPrev.style.display = multi ? 'flex' : 'none';
+      previewNext.style.display = multi ? 'flex' : 'none';
+    }
+    function navPreview(step) {
+      if (!curResults.length || curResults.length < 2) return;
+      curIdx = (curIdx + step + curResults.length) % curResults.length;
+      renderCurResult();
+    }
+    previewPrev.addEventListener('click', () => navPreview(-1));
+    previewNext.addEventListener('click', () => navPreview(1));
+    function showPreviewEmpty() {
+      previewLoading.style.display = 'none';
+      previewImg.style.display = 'none';
+      previewFailed.style.display = 'none';
+      hidePreviewExtras();
+      curTaskId = null; curResults = []; curIdx = 0;
+      previewEmpty.style.display = 'block';
+    }
+    function showPreviewFailed(errorMsg) {
+      previewLoading.style.display = 'none';
+      previewImg.style.display = 'none';
+      previewEmpty.style.display = 'none';
+      hidePreviewExtras();
+      curTaskId = null; curResults = []; curIdx = 0;
+      previewFailedMsg.textContent = errorMsg || '未知错误，请稍后重试';
+      previewFailed.style.display = 'flex';
+      if (window.lucide) lucide.createIcons();
+    }
+    // 下载：单图直接下载；多图打包为 zip 下载全部
+    previewDownload.addEventListener('click', async () => {
+      if (!previewImg.src) return;
+      // 多图：JSZip 打包全部成功图
+      if (curTaskId && curResults.length > 1) {
+        previewDownload.disabled = true;
+        try {
+          const zip = new JSZip();
+          const folderName = `gen_${curTaskId}`;
+          const folder = zip.folder(folderName);
+          for (let i = 0; i < curResults.length; i++) {
+            const url = await fetchPreviewBlob(curTaskId, curResults[i].seq);
+            const data = await (await fetch(url)).arrayBuffer();
+            folder.file(`result_${curResults[i].seq}.png`, data);
+          }
+          const blob = await zip.generateAsync({ type: 'blob' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${folderName}_${curResults.length}张.zip`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          toast(`已打包下载 ${curResults.length} 张`, 'success');
+        } catch (e) {
+          console.error('zip download failed', e);
+          toast('打包下载失败，请重试', 'error');
+        } finally {
+          previewDownload.disabled = false;
+        }
+        return;
+      }
+      // 单图：直接下载当前这张
+      const a = document.createElement('a');
+      a.href = previewImg.src;
+      a.download = curTaskId ? `gen_${curTaskId}_${curResults[curIdx]?.seq || 1}.png` : `gen_${Date.now()}.png`;
+      a.click();
+    });
+    // 点击大图放大查看（复用参考图放大弹层）
+    previewImg.addEventListener('click', () => {
+      if (previewImg.src && previewImg.style.display !== 'none') openRefModal(previewImg.src);
+    });
+    // 键盘左右键翻页（放大弹层打开时不响应）
+    document.addEventListener('keydown', (e) => {
+      if (refModal.style.display === 'flex') return;
+      if (previewImg.style.display === 'none') return;
+      if (e.key === 'ArrowLeft') navPreview(-1);
+      else if (e.key === 'ArrowRight') navPreview(1);
+    });
+
+    // ========== 提交生成 ==========
+    createForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const prompt = document.getElementById('prompt').value.trim();
+      const ratio = ratioSelect.value;
+      const n = parseInt(nInput.value) || 1;
+
+      if (!prompt) { toast('请填写提示词', 'error'); return; }
+
+      const balance = parseInt(balanceValue.textContent);
+      if (balance <= 0) { toast('余额不足，请联系管理员充值', 'error'); return; }
+
+      submitBtn.disabled = true;
+      const originalText = submitBtn.innerHTML;
+      submitBtn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;"></div> 生成中…';
+      showPreviewLoading();
+
+      try {
+        // size 直接传目标比例字符串（"1:1" / "3:4" / "4:3" / "9:16" / "16:9"），
+        // 由后端映射到平台标准尺寸请求；3:4 / 4:3 / 9:16 / 16:9 生成后后端再智能裁切到精确比例
+        const size = ratio;
+        // 批量模式：每张批量图 + 共用参考图一起独立生成 1 张；
+        // 普通模式：所有参考图一起送模型生成 n 张
+        let refPath, sharedPath = '', isBatch = 0;
+        if (batchSource) {
+          refPath = batchSource.paths.join(',');
+          sharedPath = refItems.map(it => it.path).join(',');
+          isBatch = 1;
+        } else {
+          refPath = refItems.map(it => it.path).join(',');
+        }
+
+        const taskData = {
+          prompt, size, n: isBatch ? 1 : n,
+          reference_image: refPath,
+          shared_reference_image: sharedPath,
+          batch: isBatch,
+        };
+        const task = await api.createTask(taskData);
+        const taskId = task.task_id || task.id;
+
+        // 轮询等待完成
+        const result = await pollTask(taskId, ratio);
+
+        await loadTasks();
+        await loadUser();
+        if (result === 'success') {
+          toast('生成完成', 'success');
+        } else if (result === 'failed') {
+          toast('生成失败，已自动退还额度', 'info');
+        }
+        // timeout 已经在 pollTask 内 toast 过
+      } catch (err) {
+        toast(err.message, 'error');
+        showPreviewEmpty();
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = originalText;
+      }
+    });
+
+    // ========== 轮询任务 ==========
+    // 任务预览图 blob 缓存（taskId:seq -> Promise<objectURL>），
+    // 缓存 Promise 本身：预取与用户点击并发时共享同一次下载，不会重复请求
+    const previewBlobCache = new Map();
+
+    function fetchPreviewBlob(taskId, seq) {
+      const key = `${taskId}:${seq}`;
+      if (previewBlobCache.has(key)) return previewBlobCache.get(key);
+      const promise = fetch(api.fileUrl(taskId, seq), {
+        headers: { 'Authorization': `Bearer ${auth.getToken()}` }
+      })
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.blob();
+        })
+        .then(blob => URL.createObjectURL(blob));
+      previewBlobCache.set(key, promise);
+      // 下载失败时移除缓存，允许下次重试
+      promise.catch(() => previewBlobCache.delete(key));
+      return promise;
+    }
+
+    async function pollTask(taskId, ratio) {
+      const maxTries = 120;  // 最多 4 分钟
+      for (let i = 0; i < maxTries; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const task = await api.getTask(taskId);
+          if (['completed', 'failed', 'partial'].includes(task.status)) {
+            // 拉取全部成功结果图（多图可翻页 / 全部下载）
+            const results = await api.getTaskResults(taskId);
+            const successList = (results.results || results || [])
+              .filter(r => r.status === 'success' && (r.image_path || r.image_url))
+              .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+            if (successList.length) {
+              await showTaskResults(taskId, successList, task.completed_count);
+              return 'success';
+            } else {
+              // 全部失败：在原出图位置显示失败原因（不进历史任务）
+              showPreviewFailed(task.error || '未知错误');
+              return 'failed';
+            }
+          }
+        } catch (e) {
+          console.error('poll error', e);
+        }
+      }
+      toast('生成超时，请稍后重试', 'error');
+      showPreviewEmpty();
+      return 'timeout';
+    }
+
+    // ========== 退出登录 ==========
+    logoutBtn.addEventListener('click', () => {
+      if (confirm('确定要退出登录吗？')) auth.logout();
+    });
+
+    // ========== 会话结束：删除本次会话的参考图 ==========
+    // 刷新 / 关闭页面时，当前参考图不再使用，立即通知后端删除文件（keepalive 保证请求发出）
+    window.addEventListener('beforeunload', () => {
+      // 批量图 + 参考图（批量模式下为共用参考图）都清理
+      const paths = [...(batchSource ? batchSource.paths : []), ...refItems.map(it => it.path)];
+      (paths || []).forEach(p => {
+        if (!p) return;
+        try {
+          fetch(API_BASE + '/api/upload?path=' + encodeURIComponent(p), {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${auth.getToken()}` },
+            keepalive: true,
+          });
+        } catch (e) { /* 忽略：文件由后端兜底处理 */ }
+      });
+    });
+
+    // ========== 启动 ==========
+    renderRefs();
+    (async () => {
+      try {
+        await loadUser();
+        await loadTasks();
+        updateCost();
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    })();
+  </script>
+</body>
+</html>

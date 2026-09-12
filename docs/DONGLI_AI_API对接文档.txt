@@ -1,0 +1,131 @@
+DONGLI AI 开放平台 API 对接文档
+====================================
+
+欢迎接入 DONGLI AI 开放平台。通过本平台提供的 API，您可以将强大的图像生成、图像编辑以及对话功能无缝集成到您自己的网站、应用或小程序中。
+
+所有通过 API 发起的调用，将直接从您在本平台账户的“令牌额度”或“账户余额”中进行扣费结算。
+
+------------------------------------
+1. 基础鉴权与配置
+------------------------------------
+
+* 接口请求域名: https://dilisiko.shop
+  (注：如果您收到了专属的调用域名，请以实际对外的域名为准)
+
+* 鉴权方式: 每次 API 请求必须在 HTTP Headers 中附带您的个人 API Key。
+
+* 获取 API Key: 请登录本站控制台，在“号池管理”或个人设置页面中生成并复制以 sk- 开头的密钥。
+
+【Header 请求头示例】
+Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxx
+Content-Type: application/json
+
+💡 开发者便利提醒：
+我们的接口路由和参数设计，完全兼容市面上主流的 OpenAI 开源客户端（如 NextChat、LobeChat、Dify）及标准 SDK。若您使用这些第三方工具接入本项目，只需将 Base URL 修改为 https://dilisiko.shop/v1，并填入本站的 API Key 即可快速跑通。
+
+------------------------------------
+2. 图像生成接口 (文生图)
+------------------------------------
+
+接口描述: 将自然语言描述（Prompt）转换为高质量图片。
+请求方式: POST
+请求路径: /v1/images/generations
+
+【请求参数 (JSON)】
+* prompt (必填): string - 图像生成的描述词。
+* model (选填): string - 必须指定为 gpt-image-2。
+* n (选填): integer - 生成的图像数量。范围 1-4，默认 1。
+* size (选填): string - 图像尺寸（例如：1024x1024, 16:9, 9:16 等）。
+* response_format (选填): string - 返回格式。可选 url（返回本站直链）或 b64_json（返回图片的 Base64 数据）。
+
+【请求代码示例 (cURL)】
+curl -X POST "https://dilisiko.shop/v1/images/generations" \
+  -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "一只可爱的金毛幼犬在草地上奔跑",
+    "n": 1,
+    "size": "1024x1024",
+    "response_format": "url"
+  }'
+
+【响应示例】
+{
+  "created": 1715560000,
+  "data": [
+    {
+      "url": "https://dilisiko.shop/images/2026/05/12/xxxxxx.png",
+      "revised_prompt": "A cute golden retriever puppy running on a grassy field..."
+    }
+  ]
+}
+
+------------------------------------
+3. 图像编辑接口 (图生图)
+------------------------------------
+
+接口描述: 传入一张参考图，结合您的提示词进行图像的修改、重绘或衍生创作。
+请求方式: POST
+请求路径: /v1/images/edits
+
+⚠️ 注意: 上传图片必须使用 multipart/form-data 格式，请勿发送普通 JSON。
+
+【请求参数 (Form-Data)】
+* image (必填): file - 本地基础参考图文件 (PNG、JPG等格式)。
+* prompt (必填): string - 对图像进行编辑的提示词描述。
+* model (选填): string - 建议指定为 gpt-image-2。
+* n (选填): integer - 生成数量 (1-4)。
+
+【请求代码示例 (cURL)】
+curl -X POST "https://dilisiko.shop/v1/images/edits" \
+  -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxx" \
+  -F "image=@/path/to/base_image.png" \
+  -F "prompt=给这只小狗戴上一顶红色的帽子" \
+  -F "model=gpt-image-2" \
+  -F "response_format=url"
+
+------------------------------------
+4. 文本对话接口 (对话功能)
+------------------------------------
+
+接口描述: 用于常规的文本对话功能，您可以通过该接口驱动您网站的 AI 聊天助手。
+请求方式: POST
+请求路径: /v1/chat/completions
+
+【请求代码示例 (cURL)】
+curl -X POST "https://dilisiko.shop/v1/chat/completions" \
+  -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "你好，请提供一些创意绘画的建议。"
+      }
+    ],
+    "stream": true
+  }'
+
+------------------------------------
+5. 扣费规则与错误码排查
+------------------------------------
+
+【扣费机制说明】
+本平台实行“成功后扣费”原则：
+1. 在收到生图请求时，仅预检查您的当前令牌/账户余额是否充足，不直接扣费。
+2. 只有当图像完全成功生成并返回给您时，才会扣除相应的费用。
+3. 若中途因内容违规、处理失败等原因未能出图，将不产生任何扣费。
+
+【常见错误码 (HTTP 状态码)】
+* 400 Bad Request
+  - 常见排查方案: 请求参数缺失、格式错误，或提示词触发了内容安全过滤拦截。
+* 401 Unauthorized
+  - 常见排查方案: 您填写的 API Key (令牌) 错误、未填写或已经被停用，请登录控制台检查。
+* 402 Payment Required
+  - 常见排查方案: 当前令牌或您的账户余额不足，请充值或提升此令牌的可用额度后重试。
+* 500 Server Error
+  - 常见排查方案: 平台内部处理错误，建议等待片刻后重试。
+
+*如果在接入或使用中遇到任何问题，请随时联系我们的技术人员获取支持。*

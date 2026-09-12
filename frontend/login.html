@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 — BOLI AI 批量生图</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+  <div class="auth-page">
+    <div class="auth-card card">
+      <div class="auth-logo">BOLI AI</div>
+      <div class="auth-subtitle">批量图片生成平台 · 登录到你的工作台</div>
+
+      <form class="auth-form" id="loginForm">
+        <div>
+          <label for="account">账号</label>
+          <input type="text" id="account" class="input" placeholder="请输入账号" required autocomplete="username">
+        </div>
+        <div>
+          <label for="password">密码</label>
+          <input type="password" id="password" class="input" placeholder="请输入密码" required autocomplete="current-password">
+        </div>
+        <div id="loginError" class="auth-error" hidden></div>
+        <button type="submit" class="btn btn-primary" id="submitBtn">登 录</button>
+      </form>
+
+      <div class="auth-footer">
+        还没有账号？<a href="register.html">立即注册</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/auth.js"></script>
+  <script>
+    const form = document.getElementById('loginForm');
+    const submitBtn = document.getElementById('submitBtn');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const account = document.getElementById('account').value.trim();
+      const password = document.getElementById('password').value;
+
+      const errorBox = document.getElementById('loginError');
+      errorBox.hidden = true;
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = '登录中…';
+      try {
+        const data = await api.login(account, password);
+        auth.setSession(data.token, {
+          user_id: data.user_id,
+          account: data.account,
+          balance: data.balance,
+        });
+        toast('登录成功', 'success');
+        setTimeout(() => location.href = 'dashboard.html', 400);
+      } catch (err) {
+        const zhMsg = {
+          'Assignment to constant variable': '系统错误：变量冲突，请刷新页面重试',
+        }[err.message] || err.message;
+        errorBox.textContent = zhMsg;
+        errorBox.hidden = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = '登 录';
+      }
+    });
+  </script>
+</body>
+</html>

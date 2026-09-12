@@ -1,0 +1,6 @@
+# frp 服务端配置（云服务器 8.137.70.163 用）
+bindPort = 7000
+
+# 认证 token（客户端必须一致）
+auth.method = "token"
+auth.token = "boli2026frp"

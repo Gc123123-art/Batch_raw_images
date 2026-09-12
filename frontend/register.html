@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>注册 — BOLI AI 批量生图</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+  <div class="auth-page">
+    <div class="auth-card card">
+      <div class="auth-logo">BOLI AI</div>
+      <div class="auth-subtitle">创建账号，开启批量生图之旅</div>
+
+      <span class="badge-tip"><i data-lucide="sparkles" class="lucide-icon" style="width:14px;height:14px;"></i> 注册成功后请联系管理员充值使用</span>
+
+      <form class="auth-form" id="registerForm">
+        <div>
+          <label for="account">账号</label>
+          <input type="text" id="account" class="input" placeholder="请输入账号（任意字符）" required minlength="3">
+        </div>
+        <div>
+          <label for="password">密码</label>
+          <input type="password" id="password" class="input" placeholder="至少 6 位" required minlength="6">
+        </div>
+        <div>
+          <label for="password2">确认密码</label>
+          <input type="password" id="password2" class="input" placeholder="再输入一次" required minlength="6">
+        </div>
+        <div id="registerError" class="auth-error" hidden></div>
+        <button type="submit" class="btn btn-primary" id="submitBtn">注 册</button>
+      </form>
+
+      <div class="auth-footer">
+        已有账号？<a href="login.html">返回登录</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/auth.js"></script>
+  <script>
+    const form = document.getElementById('registerForm');
+    const submitBtn = document.getElementById('submitBtn');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const account = document.getElementById('account').value.trim();
+      const password = document.getElementById('password').value;
+      const password2 = document.getElementById('password2').value;
+
+      const errorBox = document.getElementById('registerError');
+      errorBox.hidden = true;
+
+      if (password !== password2) {
+        errorBox.textContent = '两次输入的密码不一致';
+        errorBox.hidden = false;
+        return;
+      }
+      if (account.length < 3) {
+        errorBox.textContent = '账号至少 3 个字符';
+        errorBox.hidden = false;
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = '注册中…';
+      try {
+        const data = await api.register(account, password);
+        auth.setSession(data.token, {
+          user_id: data.user_id,
+          account: data.account,
+          balance: data.balance,
+        });
+        toast(data.message || '注册成功', 'success');
+        setTimeout(() => location.href = 'dashboard.html', 600);
+      } catch (err) {
+        const zhMsg = {
+          'Assignment to constant variable': '系统错误：变量冲突，请刷新页面重试',
+        }[err.message] || err.message;
+        errorBox.textContent = zhMsg;
+        errorBox.hidden = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = '注 册';
+      }
+    });
+  </script>
+</body>
+</html>

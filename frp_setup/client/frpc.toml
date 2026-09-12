@@ -1,0 +1,15 @@
+# frp 客户端配置（本地电脑 192.168.1.38 用）
+serverAddr = "8.137.70.163"
+serverPort = 7000
+
+# 认证 token（与服务端一致）
+auth.method = "token"
+auth.token = "boli2026frp"
+
+# 把本地 8899 代理端口映射到云服务器的 8899
+[[proxies]]
+name = "proxy8899"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8899
+remotePort = 8899

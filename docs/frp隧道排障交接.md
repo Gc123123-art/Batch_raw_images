@@ -1,0 +1,359 @@
+# BOLI AI Linux 迁移 & frp 隧道排障记录
+
+> 用于新对话接手时的上下文快照
+> 截止时间：2026-08-23
+
+---
+
+## 一、项目架构（当前目标状态）
+
+```
+用户浏览器
+    │  https://ai.legouhou.cn
+    ▼
+┌─────────────────────────────────────────────┐
+│ 云服务器 8.137.70.163（Linux 宝塔）          │
+│                                             │
+│  Nginx（宝塔）                               │
+│   ├─ 前端静态文件  /www/wwwroot/BoliAi/frontend │
+│   ├─ /api/ 反向代理 → http://127.0.0.1:8000  │
+│   └─ SSL 证书：Let's Encrypt（acme.sh 申请） │
+│                                             │
+│  FastAPI 后端（uvicorn 8000 端口）            │
+│    /www/wwwroot/BoliAi/backend              │
+│    config.env 含 HTTPS_PROXY=127.0.0.1:8899 │
+│         │                                   │
+│         │ 走代理                            │
+│         ▼                                   │
+│  frps（/www/frp/frps，端口 7000）             │
+└──────────────┬──────────────────────────────┘
+               │ frp 隧道（云 7000 ⇄ 本地 7000）
+               ▼
+┌─────────────────────────────────────────────┐
+│ 本地家庭电脑 192.168.1.38                    │
+│                                             │
+│  frpc（C:\frp\frpc.exe + frpc.toml）         │
+│   └─ 把本地 8899 映射到云服务器 8899          │
+│                                             │
+│  proxy.py（HTTP 代理，监听 127.0.0.1:8899）   │
+│         │                                   │
+│         ▼                                   │
+│  小扳手 xibapi.com（家庭宽带 IP）             │
+└─────────────────────────────────────────────┘
+```
+
+**关键澄清（之前用户有过疑问）**：
+- 后端跑在**云服务器**（127.0.0.1:8000），不是本地
+- 本地电脑只跑 frpc + proxy.py 两个进程
+- frp 隧道作用：让云后端通过"借"本地家庭宽带 IP 访问小扳手中转站（绕阿里云机房 IP 风控）
+
+---
+
+## 二、当前进度（已完成的）
+
+| 项 | 状态 | 备注 |
+|---|---|---|
+| Linux 宝塔环境 | ✅ 完成 | |
+| 前端代码部署 | ✅ 完成 | `/www/wwwroot/BoliAi/frontend` |
+| 后端代码部署 | ✅ 完成 | `/www/wwwroot/BoliAi/backend` |
+| Python 虚拟环境 | ✅ 完成 | 3.11 版本（解决依赖兼容性） |
+| 后端依赖安装 | ✅ 完成 | |
+| 后端服务 | ✅ 8000 端口在跑 | PID 466030 |
+| Nginx 反向代理 | ✅ 已配 | `/www/server/panel/vhost/nginx/ai.legouhou.cn.conf` |
+| ACME 文件验证段 | ✅ 已加 | SSL 申请用 |
+| 域名 ai.legouhou.cn | ✅ 站点已建 | |
+| 数据库 PostgreSQL | ✅ bunana_db | user:postgres / pass:boli123 / 5433 |
+| frps 服务 | ✅ 在跑 | systemd `boli-frps.service`，端口 7000 监听中 |
+| 宝塔防火墙 7000 端口 | ✅ 已放行 | |
+
+---
+
+## 三、当前卡点：frp 隧道 token 不匹配
+
+### 3.1 现象
+
+**云服务器 frps 日志**（一直刷错）：
+
+```
+register control error: token in login doesn't match token from configuration
+```
+
+每分钟一次，从 14.110.96.74 这个公网 IP 来的连接（**注意：这个 IP 不一定就是本地电脑的公网 IP，需要用户确认**）。
+
+**本地电脑 CMD 检查**：
+
+```bat
+C:\>tasklist | findstr frpc
+（无输出）
+
+C:\>netstat -ano | findstr "8.137.70.163:7000" | findstr ESTABLISHED
+（无输出）
+
+C:\>netstat -ano | findstr ":8899" | findstr LISTENING
+  TCP    0.0.0.0:8899    LISTENING    34072
+```
+
+- frpc 进程**没在跑**
+- proxy.py（8899）**在跑** ✓
+- 计划任务 `BOLI_Frpc` 状态"就绪"，但**上次结果 1**（启动失败退出）
+
+### 3.2 已确认的事实
+
+| 项 | 值 |
+|---|---|
+| frpc.exe 位置 | `C:\frp\frpc.exe`（15,627,776 字节） |
+| frpc.toml 位置 | `C:\frp\frpc.toml`（353 字节） |
+| 计划任务命令 | `"C:\frp\frpc.exe" -c C:\frp\frpc.toml` |
+| 计划任务运行身份 | SYSTEM |
+| 计划任务上次运行 | 2026/8/23 10:56:01（结果 1 = 失败） |
+| 触发条件 | 系统启动时 |
+| 云端 frps token | `boli2026frp`（已确认） |
+| 本地 frpc.toml token | **未知，需用户 `type C:\frp\frpc.toml` 确认** |
+
+### 3.3 真正根因
+
+**frps 进程从早先启动时加载了当时的 token 到内存，之后不重读 frps.toml**。中间有人改过 frps.toml（让 token 变成了 `boli2026frp`），但 frps 进程一直没重启，内存里依然持有旧 token。所以 frpc 启动时读到 frpc.toml 里的 `boli2026frp`，跟 frps 内存里的旧值对不上。
+
+**关键排查过程**（避免下次再走弯路）：
+1. `type C:\frp\frpc.toml` 和 `cat /www/frp/frps.toml` 看到两边都是 `boli2026frp`，肉眼一致
+2. `python -c "print(open(r'C:\frp\frpc.toml','rb').read(10).hex())"` 查 frpc.toml 字节头，无 BOM
+3. `od -c /www/frp/frps.toml` 查 frps.toml 字节，全部 ASCII 干净
+4. `/www/frp/frps -v` 和 frpc 日志都是 0.61.1，版本一致
+5. `ps -ef | grep frps` 确认 frps 就是用 `/www/frp/frps -c /www/frp/frps.toml` 启动的
+6. → 唯一没排查的就是 frps 进程内存状态。**直接重启**就能验证
+
+### 3.4 解决方案（已修复）
+
+```bash
+# 云服务器终端
+systemctl restart boli-frps
+```
+
+重启后 frps 重新加载磁盘上最新的 frps.toml，token 比对通过。
+
+**实时联动验证**（一个窗口实时跟踪 frps 日志，一个本地窗口前台跑 frpc）：
+
+```bash
+# 云端窗口
+journalctl -u boli-frps -f
+```
+
+```bat
+:: 本地窗口
+cd /d C:\frp
+frpc.exe -c frpc.toml
+```
+
+看到 frps 日志出现 `login to server success` + `[proxy8899] tcp proxy listen port [8899]` = 通了。
+
+**端到端代理链路验证**（在云端执行）：
+
+```bash
+curl --proxy http://127.0.0.1:8899 https://xibapi.com/v1/models
+# 返回 {"error":{"code":"","message":"Invalid token (request id: ...)"}} = 链路通（被中转站业务层拦截 = 通了）
+```
+
+**注意**：手动跑完后记得 `Ctrl+C` 退掉前台 frpc，否则会跟计划任务那个 frpc 抢 proxy 注册（`proxy already exists`）。
+
+---
+
+## 四、待办事项（按优先级）
+
+- [x] **修复 frp token 不匹配**（已修复，详见 3.3/3.4）
+- [x] frp 隧道修通后，验证图片生成能正常走代理（已验证浏览器成功生成）
+- [x] 申请 SSL 证书（已用 acme.sh 申请，详见第八节）
+- [x] 验证 systemd `boli-backend` 服务（后端守护）正常运行（崩溃模拟测试通过，看门狗 8 秒内拉起新进程）
+- [ ] 阿里云安全组入方向放行 TCP:7000（**已通过 frpc 成功连上 frps 隐式验证通过**，但建议在阿里云控制台再确认下安全组规则）
+
+---
+
+## 五、关键文件路径速查
+
+### 云服务器（8.137.70.163）
+| 用途 | 路径 |
+|---|---|
+| 前端 | `/www/wwwroot/BoliAi/frontend` |
+| 后端代码 | `/www/wwwroot/BoliAi/backend/app` |
+| 后端配置 | `/www/wwwroot/BoliAi/backend/config.env` |
+| 后端密钥 | `/www/wwwroot/BoliAi/backend/.secrets/` |
+| 后端虚拟环境 | `/www/wwwroot/BoliAi/backend/venv` |
+| 后端守护 | `/www/frp/boli-watch/watch_backend.py` |
+| 后端日志 | `/www/frp/boli-watch/backend.log` |
+| frps 配置 | `/www/frp/frps.toml` |
+| frps systemd | `/etc/systemd/system/boli-frps.service` |
+| Nginx 配置 | `/www/server/panel/vhost/nginx/ai.legouhou.cn.conf` |
+| Nginx 配置备份（20260823） | `/www/server/panel/vhost/nginx/ai.legouhou.cn.conf.bak.20260823` |
+| SSL 证书（acme.sh 输出） | `/www/server/panel/vhost/cert/ai.legouhou.cn.crt`（fullchain） |
+| SSL 私钥 | `/www/server/panel/vhost/cert/ai.legouhou.cn.key` |
+| acme.sh 原始证书目录 | `/root/.acme.sh/ai.legouhou.cn_ecc/` |
+
+### 本地电脑（192.168.1.38）
+| 用途 | 路径 |
+|---|---|
+| frpc | `C:\frp\frpc.exe` |
+| frpc 配置 | `C:\frp\frpc.toml` |
+| proxy.py | 全局 Python 包，启动命令含 `--timeout 900` |
+| 计划任务 | `BOLI_Frpc`、`BOLI_Proxy`、`BOLI_Watch` |
+
+---
+
+## 六、配置.env 关键内容（云服务器后端）
+
+```
+CORS_ORIGINS=http://ai.legouhou.cn,http://8.137.70.163,http://localhost:8001,http://127.0.0.1:8001
+DATABASE_URL=postgresql+psycopg2://postgres:boli123@8.137.70.163:5433/bunana_db?options=-csearch_path%3D%22AI%22
+HTTPS_PROXY=http://127.0.0.1:8899
+HTTP_PROXY=http://127.0.0.1:8899
+```
+
+---
+
+## 七、SSL 证书申请记录（2026-08-23 完成）
+
+### 为什么走 acme.sh 而不是宝塔
+
+宝塔的"网站 → SSL → Let's Encrypt"申请时报错：**"当前项目的服务（Nginx）配置文件被修改不支持文件验证"**。
+
+原因：Nginx 主配置 `ai.legouhou.cn.conf` 里 `/api/` 反向代理段是**手动写的**（不走宝塔的"反向代理"功能），宝塔认为整个 conf 文件"非标"，拒绝文件验证。
+
+走宝塔的修复路径需要：
+1. 删掉手写 `/api/` 段还原 conf
+2. 在宝塔"反向代理"功能里重新加 /api/ → 127.0.0.1:8000
+3. 才让宝塔能申请证书
+
+这条路径要动现有工作配置、还要处理 site.db 的反代记录冲突。**风险面广，不优先选**。
+
+### 走 acme.sh 的优势
+
+- **不动现有 conf**（只临时简化，申请完还原）
+- **业务中断可控**（约 30-60 秒：临时简化 conf 到还原 conf 之间）
+- **全自动续签**（acme.sh crontab 已装，每天 4 次检查，到期前自动续 + 自动 reload）
+- **证书标准**：Let's Encrypt，跟宝塔申请的完全一样，浏览器都能看到 🔒
+
+### 申请流程（重做时按此操作）
+
+```bash
+# 1. 备份当前 conf
+cp /www/server/panel/vhost/nginx/ai.legouhou.cn.conf \
+   /www/server/panel/vhost/nginx/ai.legouhou.cn.conf.bak.YYYYMMDD
+
+# 2. 安装 acme.sh（一次性，已装可跳过）
+curl https://get.acme.sh | sh
+
+# 3. 临时简化 conf（去掉 /api/ 段，保留 ACME + root + try_files）
+cat > /www/server/panel/vhost/nginx/ai.legouhou.cn.conf <<'EOF'
+server {
+    listen 80;
+    server_name ai.legouhou.cn;
+    
+    root /www/wwwroot/BoliAi/frontend;
+    index index.html;
+    
+    location ~ ^/\.well-known/acme-challenge/ {
+        allow all;
+        default_type "text/plain";
+    }
+    
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+EOF
+nginx -t && nginx -s reload
+
+# 4. 申请证书（注意 --server letsencrypt，acme.sh 默认走 ZeroSSL 需要邮箱）
+~/.acme.sh/acme.sh --issue -d ai.legouhou.cn \
+  --webroot /www/wwwroot/BoliAi/frontend \
+  --server letsencrypt
+
+# 5. 安装证书到 Nginx 目录 + 设置自动 reload
+mkdir -p /www/server/panel/vhost/cert
+~/.acme.sh/acme.sh --install-cert -d ai.legouhou.cn \
+  --key-file /www/server/panel/vhost/cert/ai.legouhou.cn.key \
+  --fullchain-file /www/server/panel/vhost/cert/ai.legouhou.cn.crt \
+  --reloadcmd "nginx -s reload"
+
+# 6. 还原 conf + 加 443 段（80 强制跳 443，443 用证书）
+cat > /www/server/panel/vhost/nginx/ai.legouhou.cn.conf <<'EOF'
+server {
+    listen 80;
+    server_name ai.legouhou.cn;
+    
+    # ACME 文件验证（acme.sh 自动续签用，正则 location 优先级高于 /）
+    location ~ ^/\.well-known/acme-challenge/ {
+        allow all;
+        default_type "text/plain";
+    }
+    
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name ai.legouhou.cn;
+    
+    ssl_certificate /www/server/panel/vhost/cert/ai.legouhou.cn.crt;
+    ssl_certificate_key /www/server/panel/vhost/cert/ai.legouhou.cn.key;
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    
+    root /www/wwwroot/BoliAi/frontend;
+    index index.html;
+    
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+    
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+EOF
+nginx -t && nginx -s reload
+```
+
+### 续签相关命令
+
+```bash
+# 查证书列表和到期时间
+~/.acme.sh/acme.sh --list
+
+# 手动强制续签
+~/.acme.sh/acme.sh --renew -d ai.legouhou.cn --force
+
+# 查自动续签 crontab
+crontab -l | grep acme
+# 预期看到：22 1,7,13,19 * * * "/root/.acme.sh"/acme.sh --cron --home "/root/.acme.sh" > /dev/null
+```
+
+### 证书信息验证
+
+```bash
+# 看证书是不是 Let's Encrypt 颁发 + 有效期
+echo | openssl s_client -connect ai.legouhou.cn:443 -servername ai.legouhou.cn 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+# 预期：issuer = "O = Let's Encrypt, CN = YE2"
+# notAfter 一般 90 天后
+```
+
+---
+
+## 八、用户偏好提醒（接手对话时注意）
+
+- 中文交流，命令一次只发一段，不要一次发一堆
+- 用户喜欢"一个问题一个问题来"，节奏要慢
+- 项目名固定是 "BOLI AI"，目录用 `BoliAi`（无空格）
+- 前后端完全分离
+- API Key 只能放后端，不能给前端
+- 改动要热部署
+- 用户对 PowerShell 兼容性问题敏感（之前出过 `unzip` 找不到、Select-String 找不到等坑）

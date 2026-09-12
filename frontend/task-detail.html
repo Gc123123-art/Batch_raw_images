@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>任务详情 — BOLI AI 批量生图</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+  <nav class="navbar">
+    <div class="container navbar-inner">
+      <a href="dashboard.html" class="navbar-logo" style="text-decoration:none;">← BOLI AI</a>
+      <div class="navbar-right">
+        <div class="balance-pill">
+          <span class="dot"></span>
+          <span>余额 <strong id="balanceValue">--</strong> 次</span>
+        </div>
+        <span class="user-avatar" id="userAvatar">?</span>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container">
+    <div class="task-detail-header">
+      <div class="task-detail-title" id="taskTitle">加载中…</div>
+      <div class="task-detail-meta">
+        <span><i data-lucide="calendar" class="lucide-icon"></i> <span id="taskTime">--</span></span>
+        <span><i data-lucide="image" class="lucide-icon"></i> 参考图: <span id="taskRef">无</span></span>
+        <span><i data-lucide="maximize" class="lucide-icon"></i> 尺寸: <span id="taskSize">--</span></span>
+        <span><i data-lucide="hash" class="lucide-icon"></i> 单次: <span id="taskN">--</span> 张</span>
+        <span class="status-badge" id="taskStatus">--</span>
+      </div>
+    </div>
+
+    <div class="progress-section">
+      <div class="label" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>生成进度</span>
+        <span id="progressText" style="color:var(--text-primary);font-weight:600;">0 / 0</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+    </div>
+
+    <div class="batch-toolbar" id="batchToolbar" style="display:none;">
+      <label class="batch-checkall">
+        <input type="checkbox" id="selectAllChk">
+        <span>全选</span>
+      </label>
+      <span class="batch-count">已选 <strong id="selectedCount">0</strong> / <span id="totalSuccessCount">0</span> 张</span>
+      <button class="btn-sm btn-batch-download" id="batchDownloadBtn" disabled>
+        <i data-lucide="download" class="lucide-icon"></i>
+        <span>批量下载</span>
+      </button>
+    </div>
+
+    <div class="result-grid" id="resultGrid">
+      <div class="card empty" style="grid-column: 1 / -1;">
+        <div>正在加载结果…</div>
+      </div>
+    </div>
+  </main>
+
+  <div class="modal" id="modal" style="display:none;">
+    <button class="modal-close" id="modalClose">×</button>
+    <div class="modal-toolbar">
+      <button class="modal-btn" id="modalZoomOut" title="缩小">−</button>
+      <span class="modal-zoom-label" id="modalZoomLabel">100%</span>
+      <button class="modal-btn" id="modalZoomIn" title="放大">+</button>
+      <button class="modal-btn" id="modalReset" title="重置">↺</button>
+      <a class="modal-btn modal-download" id="modalDownload" href="#" download title="下载"><i data-lucide="download" class="lucide-icon"></i></a>
+    </div>
+    <img id="modalImg" src="" alt="" draggable="false">
+    <div class="modal-hint">滚轮缩放 · 双击放大 · 拖动查看 · ESC 关闭</div>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/auth.js"></script>
+  <script>
+    if (!auth.requireLogin()) throw new Error('未登录');
+
+    const taskId = new URLSearchParams(location.search).get('id');
+    if (!taskId) { location.href = 'dashboard.html'; }
+
+    const titleEl = document.getElementById('taskTitle');
+    const timeEl = document.getElementById('taskTime');
+    const refEl = document.getElementById('taskRef');
+    const sizeEl = document.getElementById('taskSize');
+    const nEl = document.getElementById('taskN');
+    const statusEl = document.getElementById('taskStatus');
+    const progressText = document.getElementById('progressText');
+    const progressFill = document.getElementById('progressFill');
+    const resultGrid = document.getElementById('resultGrid');
+    const balanceValue = document.getElementById('balanceValue');
+    const userAvatar = document.getElementById('userAvatar');
+
+    const modal = document.getElementById('modal');
+    const modalImg = document.getElementById('modalImg');
+    const modalClose = document.getElementById('modalClose');
+    modalClose.addEventListener('click', () => closeModal());
+    modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+    // 缩放与拖拽
+    let scale = 1, tx = 0, ty = 0, dragging = false, dragStartX = 0, dragStartY = 0, originTx = 0, originTy = 0;
+    function applyTransform() {
+      modalImg.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      modalImg.style.cursor = scale > 1 ? (dragging ? 'grabbing' : 'grab') : 'zoom-in';
+    }
+    function resetTransform() { scale = 1; tx = 0; ty = 0; applyTransform(); }
+    function closeModal() { modal.style.display = 'none'; resetTransform(); }
+    modalImg.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? -0.15 : 0.15;
+      scale = Math.min(8, Math.max(0.2, scale + delta));
+      applyTransform();
+    }, { passive: false });
+    modalImg.addEventListener('mousedown', (e) => {
+      if (scale <= 1) return;
+      dragging = true;
+      dragStartX = e.clientX; dragStartY = e.clientY;
+      originTx = tx; originTy = ty;
+      applyTransform();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      tx = originTx + (e.clientX - dragStartX);
+      ty = originTy + (e.clientY - dragStartY);
+      applyTransform();
+    });
+    window.addEventListener('mouseup', () => { if (dragging) { dragging = false; applyTransform(); } });
+    modalImg.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      if (scale > 1) { resetTransform(); } else { scale = 2; applyTransform(); }
+    });
+    document.addEventListener('keydown', (e) => {
+      if (modal.style.display === 'flex' && e.key === 'Escape') closeModal();
+    });
+
+    // 工具栏：缩放/重置/下载
+    const modalZoomIn = document.getElementById('modalZoomIn');
+    const modalZoomOut = document.getElementById('modalZoomOut');
+    const modalReset = document.getElementById('modalReset');
+    const modalZoomLabel = document.getElementById('modalZoomLabel');
+    const modalDownload = document.getElementById('modalDownload');
+    function setScale(next) {
+      scale = Math.min(8, Math.max(0.2, next));
+      applyTransform();
+      modalZoomLabel.textContent = Math.round(scale * 100) + '%';
+    }
+    const origApply = applyTransform;
+    applyTransform = function() { origApply(); modalZoomLabel.textContent = Math.round(scale * 100) + '%'; };
+    modalZoomIn.addEventListener('click', (e) => { e.stopPropagation(); setScale(scale + 0.2); });
+    modalZoomOut.addEventListener('click', (e) => { e.stopPropagation(); setScale(scale - 0.2); });
+    modalReset.addEventListener('click', (e) => { e.stopPropagation(); resetTransform(); });
+    modalDownload.addEventListener('click', (e) => { e.stopPropagation(); });
+    if (window.lucide) lucide.createIcons();
+
+    let pollTimer = null;
+    let cachedTask = null;
+    // blob URL 缓存：避免轮询时反复下载同一张图；key = `taskId:seq`
+    const blobCache = new Map();
+    // 正在下载中的 key 集合：防止轮询期间对同一张图重复发起下载
+    const fetching = new Set();
+    // 并发限制：浏览器对同域并发连接有限（约 6），过多反而慢
+    const MAX_CONCURRENT = 6;
+
+    // 限制并发的 Promise.all
+    async function parallelLimit(items, limit, mapper) {
+      const results = new Array(items.length);
+      let idx = 0;
+      const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (true) {
+          const i = idx++;
+          if (i >= items.length) return;
+          results[i] = await mapper(items[i], i);
+        }
+      });
+      await Promise.all(workers);
+      return results;
+    }
+
+    function updateSelection() {
+      const checked = resultGrid.querySelectorAll('.img-chk:checked').length;
+      document.getElementById('selectedCount').textContent = checked;
+      document.getElementById('batchDownloadBtn').disabled = checked === 0;
+    }
+
+    async function fetchBlobAsArrayBuffer(seq) {
+      const resp = await fetch(api.fileUrl(taskId, seq), {
+        headers: { 'Authorization': `Bearer ${auth.getToken()}` }
+      });
+      if (!resp.ok) throw new Error(`第 ${seq} 张下载失败 (HTTP ${resp.status})`);
+      return await resp.arrayBuffer();
+    }
+
+    async function batchDownload() {
+      const checked = Array.from(resultGrid.querySelectorAll('.img-chk:checked'));
+      if (checked.length === 0) return;
+      const btn = document.getElementById('batchDownloadBtn');
+      const originalHtml = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<i data-lucide="loader" class="lucide-icon" style="animation:spin 1s linear infinite;"></i> 打包中…';
+      if (window.lucide) lucide.createIcons();
+      try {
+        const zip = new JSZip();
+        const promptName = (cachedTask?.prompt || 'images').slice(0, 30).replace(/[\\/:*?"<>|]/g, '_');
+        const folder = zip.folder(promptName);
+        for (let i = 0; i < checked.length; i++) {
+          const chk = checked[i];
+          const seq = parseInt(chk.dataset.seq);
+          const filename = chk.dataset.filename || `result_${seq}.png`;
+          btn.innerHTML = `<i data-lucide="loader" class="lucide-icon" style="animation:spin 1s linear infinite;"></i> 打包中 ${i + 1}/${checked.length}`;
+          if (window.lucide) lucide.createIcons();
+          const data = await fetchBlobAsArrayBuffer(seq);
+          folder.file(filename, data);
+        }
+        const blob = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${promptName}_${checked.length}张.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        toast(`已下载 ${checked.length} 张图片`, 'success');
+      } catch (e) {
+        toast(e.message || '批量下载失败', 'error');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+        if (window.lucide) lucide.createIcons();
+      }
+    }
+
+    // 全选 / 批量下载（事件委托，全局只绑一次）
+    document.getElementById('selectAllChk').addEventListener('change', e => {
+      const checked = e.target.checked;
+      resultGrid.querySelectorAll('.img-chk').forEach(chk => { chk.checked = checked; });
+      updateSelection();
+    });
+    // 点击工具栏任意空白处（排除复选框本身、批量下载按钮）→ 切换全选
+    document.getElementById('batchToolbar').addEventListener('click', e => {
+      if (e.target.closest('input,button,label,a')) return;  // 这些元素自身处理
+      const chk = document.getElementById('selectAllChk');
+      if (chk.disabled) return;
+      chk.checked = !chk.checked;
+      chk.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    document.getElementById('batchDownloadBtn').addEventListener('click', batchDownload);
+
+    // 点击图片放大：事件委托整 grid（不依赖 data-url，加载中的占位也能点）
+    // 若图片尚未下载完成，点击后先等待下载再放大
+    resultGrid.addEventListener('click', async (e) => {
+      const aEl = e.target.closest('a[download]');
+      if (aEl) {
+        // 下载链接：阻止冒泡 + 主动触发下载
+        e.preventDefault();
+        e.stopPropagation();
+        const href = aEl.getAttribute('href');
+        const filename = aEl.getAttribute('download') || 'image';
+        if (href) {
+          const a = document.createElement('a');
+          a.href = href; a.download = filename;
+          document.body.appendChild(a); a.click(); a.remove();
+        }
+        return;
+      }
+      const box = e.target.closest('.result-image');
+      if (!box) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const card = box.closest('.result-card');
+      if (!card || !card.dataset.seq) return;  // 失败/等待中卡片不放大
+      const seq = parseInt(card.dataset.seq);
+      const open = (url, filename) => {
+        modalImg.src = url;
+        modalDownload.href = url;
+        if (filename) modalDownload.setAttribute('download', filename);
+        resetTransform();
+        modal.style.display = 'flex';
+        modalZoomLabel.textContent = '100%';
+      };
+      // 已有缓存直接打开
+      const cached = blobCache.get(`${taskId}:${seq}`);
+      if (cached) {
+        const cardA = card.querySelector('a[download]');
+        open(cached, cardA ? cardA.getAttribute('download') : '');
+        return;
+      }
+      // 没有缓存：拉一次再打开
+      const btnText = box.innerHTML;
+      box.innerHTML = '<div class="result-loading"><div class="spinner"></div><span>加载中…</span></div>';
+      try {
+        const blob = await fetch(api.fileUrl(taskId, seq), {
+          headers: { 'Authorization': `Bearer ${auth.getToken()}` }
+        }).then(rs => rs.blob());
+        const url = URL.createObjectURL(blob);
+        blobCache.set(`${taskId}:${seq}`, url);
+        box.dataset.url = url;
+        box.innerHTML = `<img src="${url}" alt="" loading="lazy">`;
+        const cardA = card.querySelector('a[download]');
+        const filename = cardA ? cardA.getAttribute('download') : '';
+        if (cardA) cardA.href = url;
+        open(url, filename);
+      } catch (err) {
+        box.innerHTML = btnText;
+        toast(err.message || '图片加载失败', 'error');
+      }
+    });
+
+    async function loadUser() {
+      const u = await auth.loadProfile();
+      balanceValue.textContent = u.balance;
+      userAvatar.textContent = firstChar(u.account);
+    }
+
+    async function loadTask() {
+      const task = await api.getTask(taskId);
+      cachedTask = task;
+      titleEl.textContent = task.prompt;
+      timeEl.textContent = formatTime(task.created_at);
+      // 参考图数量：批量任务显示 批量 N 张 + 共用 M 张
+      const refCount = (task.reference_image || '').split(',').filter(Boolean).length;
+      const sharedCount = (task.shared_reference_image || '').split(',').filter(Boolean).length;
+      refEl.textContent = refCount
+        ? (sharedCount > 0
+            ? `批量 ${refCount} 张 + 共用 ${sharedCount} 张`
+            : (task.batch ? `批量 ${refCount} 张` : `${refCount} 张`))
+        : '无';
+      sizeEl.textContent = task.size;
+      nEl.textContent = task.n;
+      statusEl.className = `status-badge status-${task.status}`;
+      statusEl.textContent = statusText(task.status);
+
+      const pct = task.total_count > 0 ? (task.completed_count / task.total_count * 100) : 0;
+      progressText.textContent = `${task.completed_count} / ${task.total_count}`;
+      progressFill.style.width = pct + '%';
+
+      await loadResults();
+    }
+
+    async function loadResults() {
+      try {
+        const resp = await api.getTaskResults(taskId);
+        const results = resp.results || resp || [];
+        if (!cachedTask) return;
+        const total = cachedTask.total_count;
+        const items = [];
+
+        for (let i = 1; i <= total; i++) {
+          const r = results.find(x => x.seq === i);
+          items.push(r || { seq: i, status: 'pending' });
+        }
+
+        // 先渲染（已缓存的图直接显示；未缓存的显示占位，下载完成后填充）
+        resultGrid.innerHTML = items.map((r, idx) => {
+          if (r.status === 'success' && (r.image_path || r.image_url)) {
+            const url = blobCache.get(`${taskId}:${r.seq}`) || '';
+            // 文件名：URL 模式下从 image_url 末段取；data URL / 本地模式回退到序号名
+            const filename = r.image_path
+              ? r.image_path.split(/[\\/]/).pop()
+              : (r.image_url.startsWith('data:')
+                  ? `result_${r.seq}.png`
+                  : (r.image_url.split('/').pop().split('?')[0] || `result_${r.seq}.png`));
+            return `
+              <div class="result-card" data-seq="${r.seq}">
+                <div class="result-image"${url ? ` data-url="${url}"` : ''}>
+                  ${url
+                    ? `<img src="${url}" alt="" loading="lazy">`
+                    : `<div class="result-loading"><div class="spinner"></div><span>加载中…</span></div>`}
+                </div>
+                <div class="result-info" data-stop="1" style="cursor:pointer;">
+                  <span class="result-seq">第 ${r.seq} 张</span>
+                  <label class="result-checkbox-inline" data-stop="1" title="选中以加入批量下载">
+                    <input type="checkbox" class="img-chk" data-seq="${r.seq}" data-filename="${filename}">
+                  </label>
+                  <a href="${url}" download="${filename}" style="font-size:11px;">下载</a>
+                </div>
+              </div>`;
+          } else if (r.status === 'failed') {
+            return `
+              <div class="result-card">
+                <div class="result-image">
+                  <div class="result-placeholder"><i data-lucide="x-circle" class="lucide-icon"></i> 生成失败</div>
+                </div>
+                <div class="result-error">${escapeHtml(r.error || '未知错误')}</div>
+              </div>`;
+          } else {
+            return `
+              <div class="result-card">
+                <div class="result-image">
+                  <div class="result-loading">
+                    <div class="spinner"></div>
+                    <span>等待生成…</span>
+                  </div>
+                </div>
+                <div class="result-info">
+                  <span>第 ${r.seq} 张</span>
+                </div>
+              </div>`;
+          }
+        }).join('');
+
+
+        // "第 N 张" 整行点击（白色背景区）→ 切换同行复选框
+        // 行内的复选框/下载链接自身 data-stop，已被外层 stopPropagation 拦下
+        resultGrid.querySelectorAll('.result-info').forEach(infoEl => {
+          infoEl.addEventListener('click', e => {
+            // 复选框 label / 下载链接 / 复选框本身 已有 data-stop，由外层 [data-stop] 拦下
+            // 这里只处理"其它空白"被冒泡到 .result-info 上的情况
+            const chk = infoEl.querySelector('.img-chk');
+            if (!chk) return;
+            chk.checked = !chk.checked;
+            chk.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+        });
+
+        // 多选 + 全选 + 批量下载
+        const successCount = resultGrid.querySelectorAll('.img-chk').length;
+        const toolbar = document.getElementById('batchToolbar');
+        toolbar.style.display = successCount > 0 ? 'flex' : 'none';
+        document.getElementById('totalSuccessCount').textContent = successCount;
+        const selectAllChk = document.getElementById('selectAllChk');
+        selectAllChk.checked = false;
+        selectAllChk.disabled = successCount === 0;
+        updateSelection();
+
+        resultGrid.querySelectorAll('.img-chk').forEach(chk => {
+          chk.addEventListener('change', () => {
+            // 同步全选状态
+            const all = resultGrid.querySelectorAll('.img-chk');
+            const checked = resultGrid.querySelectorAll('.img-chk:checked');
+            selectAllChk.checked = all.length > 0 && all.length === checked.length;
+            selectAllChk.indeterminate = checked.length > 0 && checked.length < all.length;
+            updateSelection();
+          });
+        });
+
+        // 后台填充：未缓存的图并发下载（限制并发），完成后替换占位为图片
+        // 不阻塞本轮渲染；用 fetching 集合防止轮询期间重复下载同一张
+        const missing = items.filter(r => r.status === 'success' && (r.image_path || r.image_url) && !blobCache.has(`${taskId}:${r.seq}`));
+        const keys = missing.map(r => `${taskId}:${r.seq}`).filter(k => !fetching.has(k));
+        const toFill = missing.filter(r => keys.includes(`${taskId}:${r.seq}`));
+        toFill.forEach(r => fetching.add(`${taskId}:${r.seq}`));
+        parallelLimit(toFill, MAX_CONCURRENT, async (r) => {
+          try {
+            const blob = await fetch(api.fileUrl(taskId, r.seq), {
+              headers: { 'Authorization': `Bearer ${auth.getToken()}` }
+            }).then(rs => rs.blob());
+            const url = URL.createObjectURL(blob);
+            blobCache.set(`${taskId}:${r.seq}`, url);
+            const imageBox = resultGrid.querySelector(`.result-card[data-seq="${r.seq}"] .result-image`);
+            if (imageBox) {
+              imageBox.dataset.url = url;
+              imageBox.innerHTML = `<img src="${url}" alt="" loading="lazy">`;
+              // 同步下载链接
+              const aEl = imageBox.parentElement.querySelector('a[download]');
+              if (aEl) aEl.href = url;
+            }
+          } catch (e) {
+            console.error('image fetch error', e);
+          } finally {
+            fetching.delete(`${taskId}:${r.seq}`);
+          }
+        });
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(async () => {
+        try {
+          const task = await api.getTask(taskId);
+          const wasRunning = cachedTask && ['pending', 'running'].includes(cachedTask.status);
+          cachedTask = task;
+          const pct = task.total_count > 0 ? (task.completed_count / task.total_count * 100) : 0;
+          progressText.textContent = `${task.completed_count} / ${task.total_count}`;
+          progressFill.style.width = pct + '%';
+          statusEl.className = `status-badge status-${task.status}`;
+          statusEl.textContent = statusText(task.status);
+
+          if (wasRunning || task.status === 'pending' || task.status === 'running') {
+            await loadResults();
+          }
+
+          if (['completed', 'failed', 'partial'].includes(task.status)) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            await loadResults();
+            loadUser(); // 刷新余额
+            toast(`任务已${statusText(task.status)}`, task.status === 'failed' ? 'error' : 'success');
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      }, 2000);
+    }
+
+    // tab 切换时停止轮询
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      } else if (!document.hidden && !pollTimer && cachedTask && ['pending', 'running'].includes(cachedTask.status)) {
+        startPolling();
+      }
+    });
+
+    (async () => {
+      try {
+        await loadUser();
+        await loadTask();
+        if (['pending', 'running'].includes(cachedTask.status)) {
+          startPolling();
+        }
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    })();
+  </script>
+</body>
+</html>
