@@ -56,6 +56,10 @@ PREVIEW_SIG_TTL = int(os.getenv("PREVIEW_SIG_TTL", "86400"))
 # 任务停滞超时（秒）：running 任务超过该时长无进度更新，视为卡死，由看门狗标记失败并退款
 TASK_STALL_TIMEOUT = int(os.getenv("TASK_STALL_TIMEOUT", "900"))
 
+# 全局 AI 调用并发上限：跨所有任务共享（每张图的生成调用共用这些并发额度），
+# 防止大批量任务 / 多任务同时执行瞬间打满供应商限流和 frp 代理
+AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "20"))
+
 # CORS 允许来源（生产环境通过 CORS_ORIGINS 环境变量配置）
 CORS_ORIGINS = [
     o.strip() for o in os.getenv(

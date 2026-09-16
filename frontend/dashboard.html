@@ -275,13 +275,15 @@
           return;
         }
         taskList.innerHTML = tasks.map(t => {
-          const pct = t.total_count > 0 ? (t.completed_count / t.total_count * 100) : 0;
+          const done = t.completed_count || 0;
+          const total = Math.max(done, 1);
+          const pct = done >= total ? 100 : (done / total * 100);
           return `
             <div class="task-item fade-in" data-id="${t.id}">
               <div class="task-prompt">${escapeHtml(t.prompt)}</div>
               <div class="task-progress">
                 <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
-                <span style="font-size:11px;color:var(--text-tertiary);min-width:42px;">${t.completed_count}/${t.total_count}</span>
+                <span style="font-size:11px;color:var(--text-tertiary);min-width:42px;">${done} 张</span>
               </div>
               <span class="status-badge status-${t.status}">${statusText(t.status)}</span>
             </div>`;
@@ -289,7 +291,7 @@
         if (window.lucide) lucide.createIcons();
         taskList.querySelectorAll('.task-item').forEach(el => {
           el.addEventListener('click', () => {
-            location.href = `task-detail.html?id=${el.dataset.id}`;
+            location.href = `task-detail.html?id=${encodeURIComponent(el.dataset.id)}`;
           });
         });
       } catch (e) {

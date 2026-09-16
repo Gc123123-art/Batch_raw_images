@@ -54,6 +54,12 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class SetUserChangeRequest(BaseModel):
+    """设置用户分组数字（与供应商 change 数字相等才匹配使用）"""
+    user_id: int
+    change: int
+
+
 class ProviderCreateRequest(BaseModel):
     """新增 API 供应商（只需填写核心 3 项）"""
     name: str
@@ -62,6 +68,7 @@ class ProviderCreateRequest(BaseModel):
     model: str = ""
     enabled: int = 1
     priority: int = 0
+    change: int = 0
 
 
 class ProviderUpdateRequest(BaseModel):
@@ -72,6 +79,7 @@ class ProviderUpdateRequest(BaseModel):
     model: str = ""
     enabled: int = 1
     priority: int = 0
+    change: int = 0
 
 
 class ProviderToggleRequest(BaseModel):

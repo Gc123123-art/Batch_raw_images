@@ -244,6 +244,7 @@
                                 <th>ID</th>
                                 <th>账号</th>
                                 <th>余额（次）</th>
+                                <th>线路</th>
                                 <th>注册时间</th>
                                 <th style="min-width:240px">操作</th>
                             </tr>
@@ -285,6 +286,7 @@
         const toast = document.getElementById('toast');
 
         let adminKey = '';
+        let usersCache = [];  // 当前用户列表缓存（用于判断线路 change 是否被修改）
 
         function showToast(msg, type = 'success') {
             toast.textContent = msg;
@@ -334,11 +336,15 @@
                 }
 
                 tableWrap.style.display = 'block';
+                usersCache = users;
                 usersBody.innerHTML = users.map(u => `
                     <tr>
                         <td><code>${u.id}</code></td>
                         <td><strong>${escapeHtml(u.account)}</strong></td>
                         <td><span class="badge" style="background:var(--accent);font-size:14px">${u.balance}</span></td>
+                        <td>
+                            <input type="number" id="chg_${u.id}" value="${u.change || 0}" min="0" style="width:56px" title="分组数字，与供应商 change 相等才匹配">
+                        </td>
                         <td style="color:var(--text-secondary);font-size:13px">${u.created_at || '-'}</td>
                         <td>
                             <div class="balance-control">
@@ -366,6 +372,7 @@
         async function confirmBalance(userId) {
             const setInput = document.getElementById(`set_${userId}`);
             const addInput = document.getElementById(`add_${userId}`);
+            const chgInput = document.getElementById(`chg_${userId}`);
             const toNum = (s) => {
                 const t = s.trim().replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
                 return t === '' ? null : Number(t);
@@ -373,8 +380,21 @@
             const setVal = toNum(setInput.value);
             const addVal = toNum(addInput.value);
 
-            if (setVal === null && addVal === null) {
-                showToast('请先在"设余额"或"+加次数"中填一个数字', 'error');
+            // 线路分组：与原值比较，改了才提交
+            const cached = usersCache.find(u => u.id === userId);
+            const origChange = Number(cached && cached.change || 0);
+            let chgVal = null;
+            if (chgInput) {
+                const raw = toNum(chgInput.value);
+                if (raw === null || !Number.isInteger(raw) || raw < 0) {
+                    showToast('线路分组必须是 >= 0 的整数', 'error');
+                    return;
+                }
+                if (raw !== origChange) chgVal = raw;
+            }
+
+            if (setVal === null && addVal === null && chgVal === null) {
+                showToast('没有要保存的修改（设余额 / 加次数 / 线路均未改动）', 'error');
                 return;
             }
             if (setVal !== null && addVal !== null) {
@@ -383,6 +403,18 @@
             }
 
             try {
+                let savedChange = false;
+                if (chgVal !== null) {
+                    const r = await fetch(`${API_BASE}/api/admin/set_user_change`, {
+                        method: 'POST',
+                        headers: getHeaders(),
+                        body: JSON.stringify({ user_id: userId, change: chgVal })
+                    });
+                    const data = await r.json();
+                    if (!r.ok) throw new Error(data.detail || '保存线路失败');
+                    savedChange = true;
+                }
+
                 if (setVal !== null) {
                     if (!Number.isFinite(setVal) || setVal < 0) { showToast('请输入有效数字', 'error'); return; }
                     const r = await fetch(`${API_BASE}/api/admin/set_balance`, {
@@ -393,7 +425,7 @@
                     const data = await r.json();
                     if (!r.ok) throw new Error(data.detail || '操作失败');
                     showToast(`用户 ${data.user_id} 余额已设为 ${data.new_balance}`);
-                } else {
+                } else if (addVal !== null) {
                     if (!Number.isFinite(addVal) || addVal < 1) { showToast('请输入有效数字', 'error'); return; }
                     const r = await fetch(`${API_BASE}/api/admin/recharge`, {
                         method: 'POST',
@@ -403,6 +435,8 @@
                     const data = await r.json();
                     if (!r.ok) throw new Error(data.detail || '操作失败');
                     showToast(`用户 ${data.user_id} 增加 ${data.amount} 次，当前余额 ${data.new_balance}`);
+                } else if (savedChange) {
+                    showToast(`用户 ${userId} 线路分组已改为 ${chgVal}（只调用 change=${chgVal} 的供应商）`);
                 }
                 setInput.value = '';
                 addInput.value = '';

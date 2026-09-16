@@ -88,15 +88,15 @@ const api = {
   deleteUpload: (path) =>
     request('/api/upload?path=' + encodeURIComponent(path), { method: 'DELETE' }),
 
-  // 任务
+  // 任务（id 为创建时间字符串，URL 中需编码空格/冒号）
   createTask: (data) => request('/api/tasks', { method: 'POST', body: data }),
   listTasks: () => request('/api/tasks'),
-  getTask: (id) => request(`/api/tasks/${id}`),
-  getTaskResults: (id) => request(`/api/tasks/${id}/results`),
-  executeTask: (id) => request(`/api/tasks/${id}/execute`, { method: 'POST' }),
+  getTask: (id) => request(`/api/tasks/${encodeURIComponent(id)}`),
+  getTaskResults: (id) => request(`/api/tasks/${encodeURIComponent(id)}/results`),
+  executeTask: (id) => request(`/api/tasks/${encodeURIComponent(id)}/execute`, { method: 'POST' }),
 
   // 文件
-  fileUrl: (taskId, seq) => `${API_BASE}/api/files/${taskId}/${seq}`,
+  fileUrl: (taskId, seq) => `${API_BASE}/api/files/${encodeURIComponent(taskId)}/${seq}`,
 };
 
 window.api = api;

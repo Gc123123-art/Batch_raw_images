@@ -12,10 +12,11 @@
 
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from dotenv import dotenv_values
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import DATABASE_URL, BACKEND_DIR, provider_env_files
 
@@ -99,35 +100,24 @@ _POSTGRES_DDL = [
         account     TEXT    UNIQUE NOT NULL,
         password    TEXT    NOT NULL,
         balance     INTEGER NOT NULL DEFAULT 0,
+        "change"    INTEGER NOT NULL DEFAULT 0,
         created_at  TEXT    NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS tasks (
-        id              SERIAL PRIMARY KEY,
-        user_id         INTEGER NOT NULL REFERENCES users(id),
+        account         TEXT    NOT NULL,
         prompt          TEXT    NOT NULL,
         reference_image TEXT    DEFAULT '',
         shared_reference_image TEXT DEFAULT '',
         size            TEXT    DEFAULT '1024x1024',
-        n               INTEGER DEFAULT 1,
-        total_count     INTEGER DEFAULT 1,
-        completed_count INTEGER DEFAULT 0,
         status          TEXT    DEFAULT 'pending',
         amount          INTEGER NOT NULL DEFAULT 0,
         remark          TEXT    DEFAULT '',
         batch           INTEGER NOT NULL DEFAULT 0,
+        image_url       TEXT    DEFAULT '{}',
+        error           TEXT    DEFAULT '',
         updated_at      TEXT    NOT NULL,
-        created_at      TEXT    NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS task_results (
-        id          SERIAL PRIMARY KEY,
-        task_id     INTEGER NOT NULL REFERENCES tasks(id),
-        seq         INTEGER DEFAULT 1,
-        image_path  TEXT    DEFAULT '',
-        image_url   TEXT    DEFAULT '',
-        prompt      TEXT    DEFAULT '',
-        status      TEXT    DEFAULT 'pending',
-        error       TEXT    DEFAULT '',
-        created_at  TEXT    NOT NULL
+        created_at      TEXT    NOT NULL,
+        PRIMARY KEY (account, created_at)
     )""",
     """CREATE TABLE IF NOT EXISTS api_providers (
         id          SERIAL PRIMARY KEY,
@@ -137,8 +127,7 @@ _POSTGRES_DDL = [
         model       TEXT    DEFAULT '',
         enabled     INTEGER DEFAULT 1,
         priority    INTEGER DEFAULT 0,
-        created_at  TEXT    NOT NULL,
-        updated_at  TEXT    NOT NULL
+        "change"    INTEGER NOT NULL DEFAULT 0
     )""",
 ]
 
@@ -149,35 +138,24 @@ _MYSQL_DDL = [
         account     VARCHAR(255) UNIQUE NOT NULL,
         password    VARCHAR(255) NOT NULL,
         balance     INT NOT NULL DEFAULT 0,
+        `change`    INT NOT NULL DEFAULT 0,
         created_at  VARCHAR(32) NOT NULL
     ) DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS tasks (
-        id              INT AUTO_INCREMENT PRIMARY KEY,
-        user_id         INT NOT NULL,
+        account         VARCHAR(190) NOT NULL,
         prompt          VARCHAR(4000) NOT NULL,
         reference_image VARCHAR(500) DEFAULT '',
         shared_reference_image VARCHAR(500) DEFAULT '',
         size            VARCHAR(32) DEFAULT '1024x1024',
-        n               INT DEFAULT 1,
-        total_count     INT DEFAULT 1,
-        completed_count INT DEFAULT 0,
         status          VARCHAR(32) DEFAULT 'pending',
         amount          INT NOT NULL DEFAULT 0,
         remark          VARCHAR(500) DEFAULT '',
         batch           INT NOT NULL DEFAULT 0,
+        image_url       TEXT,
+        error           VARCHAR(1000) DEFAULT '',
         updated_at      VARCHAR(32) NOT NULL,
-        created_at      VARCHAR(32) NOT NULL
-    ) DEFAULT CHARSET=utf8mb4""",
-    """CREATE TABLE IF NOT EXISTS task_results (
-        id          INT AUTO_INCREMENT PRIMARY KEY,
-        task_id     INT NOT NULL,
-        seq         INT DEFAULT 1,
-        image_path  VARCHAR(500) DEFAULT '',
-        image_url   VARCHAR(500) DEFAULT '',
-        prompt      VARCHAR(4000) DEFAULT '',
-        status      VARCHAR(32) DEFAULT 'pending',
-        error       VARCHAR(1000) DEFAULT '',
-        created_at  VARCHAR(32) NOT NULL
+        created_at      VARCHAR(32) NOT NULL,
+        PRIMARY KEY (account, created_at)
     ) DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS api_providers (
         id          INT AUTO_INCREMENT PRIMARY KEY,
@@ -187,8 +165,7 @@ _MYSQL_DDL = [
         model       VARCHAR(255) DEFAULT '',
         enabled     INT DEFAULT 1,
         priority    INT DEFAULT 0,
-        created_at  VARCHAR(32) NOT NULL,
-        updated_at  VARCHAR(32) NOT NULL
+        `change`    INT NOT NULL DEFAULT 0
     ) DEFAULT CHARSET=utf8mb4""",
 ]
 
@@ -197,13 +174,24 @@ _DDL = {
     "mysql": _MYSQL_DDL,
 }
 
+# change 在 MySQL 中是保留字，共享 SQL 里按方言引用列名
+_CHANGE_COL = '"change"' if _dialect == "postgresql" else "`change`"
+
 # 存量表补列迁移（列已存在时报错忽略，保证幂等）
 _MIGRATIONS = {
     "postgresql": [
         "ALTER TABLE tasks ADD COLUMN shared_reference_image TEXT DEFAULT ''",
+        'ALTER TABLE users ADD COLUMN "change" INTEGER NOT NULL DEFAULT 0',
+        'ALTER TABLE api_providers ADD COLUMN "change" INTEGER NOT NULL DEFAULT 0',
+        "ALTER TABLE api_providers DROP COLUMN created_at",
+        "ALTER TABLE api_providers DROP COLUMN updated_at",
     ],
     "mysql": [
         "ALTER TABLE tasks ADD COLUMN shared_reference_image VARCHAR(500) DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN `change` INT NOT NULL DEFAULT 0",
+        "ALTER TABLE api_providers ADD COLUMN `change` INT NOT NULL DEFAULT 0",
+        "ALTER TABLE api_providers DROP COLUMN created_at",
+        "ALTER TABLE api_providers DROP COLUMN updated_at",
     ],
 }
 
@@ -213,12 +201,15 @@ def init_db():
     with get_write_conn() as conn:
         for stmt in _DDL[_dialect]:
             conn.exec_driver_sql(stmt)
-        for stmt in _MIGRATIONS[_dialect]:
-            try:
-                conn.exec_driver_sql(stmt)
-            except Exception:
-                pass  # 列已存在
         _seed_providers_from_env(conn)
+    # 迁移必须独立于上面的事务：PostgreSQL 中语句失败会中止整个事务，
+    # 若与建表/种子同事务，"列已存在"的报错会导致后续语句全部失败
+    for stmt in _MIGRATIONS[_dialect]:
+        try:
+            with _get_engine().begin() as mconn:
+                mconn.exec_driver_sql(stmt)
+        except Exception:
+            pass  # 列已存在
 
 
 # ============================================================
@@ -253,22 +244,19 @@ def _seed_providers_from_env(conn):
         name = env_file.stem.replace("config-", "", 1)
         _collect(name, dotenv_values(env_file))
 
-    now = _now()
     for priority, key in enumerate(order):
         entry = grouped[key]
         cfg = entry["cfg"]
         conn.exec_driver_sql(
-            _q("""INSERT INTO api_providers
-               (name, api_key, base_url, model, priority, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)"""),
+            _q(f"""INSERT INTO api_providers
+               (name, api_key, base_url, model, priority, {_CHANGE_COL})
+               VALUES (?, ?, ?, ?, ?, 0)"""),
             (
                 (cfg.get("SUPPLIER_NAME") or "").strip() or entry["name"],
                 key,
                 cfg.get("BASE_URL", ""),
                 cfg.get("DEFAULT_MODEL", "") or "",
                 priority,
-                now,
-                now,
             ),
         )
 
@@ -318,8 +306,10 @@ def add_balance(user_id: int, amount: int):
 def delete_user(user_id: int):
     """删除用户及其所有关联数据"""
     with get_write_conn() as conn:
-        conn.exec_driver_sql(_q("DELETE FROM task_results WHERE task_id IN (SELECT id FROM tasks WHERE user_id = ?)"), (user_id,))
-        conn.exec_driver_sql(_q("DELETE FROM tasks WHERE user_id = ?"), (user_id,))
+        conn.exec_driver_sql(
+            _q("DELETE FROM tasks WHERE account = (SELECT account FROM users WHERE id = ?)"),
+            (user_id,),
+        )
         conn.exec_driver_sql(_q("DELETE FROM users WHERE id = ?"), (user_id,))
 
 
@@ -344,89 +334,176 @@ def change_password(user_id: int, new_hashed: str):
 # ============================================================
 # 任务操作
 # ============================================================
-def create_task(user_id: int, prompt: str, reference_image: str = "",
+# ============================================================
+# 任务操作（任务以 account + created_at 定位；对外 id = created_at）
+# ============================================================
+def _parse_image_url_map(task: dict) -> dict:
+    """解析 tasks.image_url JSON 列为 {seq:int -> url:str}，坏数据按空处理"""
+    import json
+    try:
+        raw = json.loads(task.get("image_url") or "{}")
+        return {int(k): v for k, v in dict(raw).items() if v}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _alias_task(row: dict) -> dict:
+    """给任务行补充兼容字段：id（= created_at，供前端链接定位）、
+    completed_count（= image_url JSON 里已生成的张数）"""
+    if row is None:
+        return row
+    row = dict(row)
+    row["id"] = row["created_at"]
+    row["completed_count"] = len(_parse_image_url_map(row))
+    return row
+
+
+def create_task(account: str, prompt: str, reference_image: str = "",
                 shared_reference_image: str = "",
-                size: str = "1024x1024", n: int = 1,
-                total_count: int = 1, batch: int = 0) -> int:
-    """创建任务，返回 task_id（batch=1 表示批量模式，每张参考图独立生成；
-    shared_reference_image 为批量模式下附加到每张批量图的共用参考图）"""
+                size: str = "1024x1024", batch: int = 0) -> str:
+    """创建任务，返回任务标识 created_at（batch=1 表示批量模式，每张参考图独立生成；
+    shared_reference_image 为批量模式下附加到每张批量图的共用参考图）
+
+    主键为 (account, created_at) 秒级时间戳，同一账号同一秒创建多个任务会冲突，
+    冲突时 created_at 顺延 1 秒重试（最多 10 次）。
+    """
     now = _now()
-    with get_write_conn() as conn:
-        task_id = _insert_id(
-            conn,
-            """INSERT INTO tasks
-               (user_id, prompt, reference_image, shared_reference_image,
-                size, n, total_count, status, batch, updated_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
-            (user_id, prompt, reference_image, shared_reference_image,
-             size, n, total_count, batch, now, now),
-        )
-        for seq in range(1, total_count + 1):
-            conn.exec_driver_sql(
-                _q("INSERT INTO task_results (task_id, seq, status, created_at) VALUES (?, ?, 'pending', ?)"),
-                (task_id, seq, now),
-            )
-        return task_id
+    for _ in range(10):
+        try:
+            with get_write_conn() as conn:
+                conn.exec_driver_sql(
+                    _q("""INSERT INTO tasks
+                       (account, prompt, reference_image, shared_reference_image,
+                        size, status, batch, image_url, updated_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, 'pending', ?, '{}', ?, ?)"""),
+                    (account, prompt, reference_image, shared_reference_image,
+                     size, batch, now, now),
+                )
+            return now
+        except IntegrityError:
+            now = (datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
+                   + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+    return now
 
 
-def get_user_tasks(user_id: int, page: int = 1, page_size: int = 20) -> list:
+def get_user_tasks(account: str, page: int = 1, page_size: int = 20) -> list:
     """获取用户的任务列表（过滤掉全部失败的任务）"""
     offset = (page - 1) * page_size
-    return _read_all(
+    rows = _read_all(
         """SELECT * FROM tasks
-           WHERE user_id = ? AND status != 'failed'
+           WHERE account = ? AND status != 'failed'
            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        (user_id, page_size, offset),
+        (account, page_size, offset),
     )
+    return [_alias_task(r) for r in rows]
 
 
-def get_task_by_id(task_id: int) -> dict:
-    """获取任务详情"""
-    return _read_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-
-
-def get_task_results(task_id: int) -> list:
-    """获取任务的生成结果列表"""
-    return _read_all(
-        "SELECT * FROM task_results WHERE task_id = ? ORDER BY seq",
-        (task_id,),
+def get_task_by_key(account: str, created_at: str) -> dict:
+    """获取任务详情（account + created_at 定位）"""
+    row = _read_one(
+        "SELECT * FROM tasks WHERE account = ? AND created_at = ?",
+        (account, created_at),
     )
+    return _alias_task(row)
 
 
-def get_task_result_by_seq(task_id: int, seq: int) -> dict:
-    """按 task_id + seq 单条查询（消除 N+1：单张图只查一行）"""
-    return _read_one(
-        "SELECT * FROM task_results WHERE task_id = ? AND seq = ?",
-        (task_id, seq),
-    )
+def get_task_results(account: str, created_at: str) -> list:
+    """从 tasks 行派生生成结果列表（每张图：seq / image_url / status）
+
+    只返回已成功生成的图（image_url JSON 里有 seq 的）；失败信息看任务级 error。
+    """
+    task = get_task_by_key(account, created_at)
+    if not task:
+        return []
+    url_map = _parse_image_url_map(task)
+    return [
+        {"seq": seq, "image_path": "", "image_url": url,
+         "status": "success", "error": ""}
+        for seq, url in sorted(url_map.items())
+    ]
 
 
-def update_task_progress(task_id: int, completed: int, status: str = "running"):
-    """更新任务进度（同时刷新 updated_at，供看门狗判断任务是否停滞）"""
+def set_task_image_url(account: str, created_at: str, seq: int, image_url: str):
+    """把第 seq 张图的链接合并进 tasks.image_url JSON（原子合并，并发安全）
+
+    同时刷新 updated_at 作为任务心跳（看门狗据此判断任务是否停滞）
+    """
+    import json
+    patch = json.dumps({str(seq): image_url})
+    with get_write_conn() as conn:
+        if _dialect == "postgresql":
+            conn.exec_driver_sql(
+                """UPDATE tasks
+                   SET image_url = COALESCE(NULLIF(image_url, ''), '{}')::jsonb || %s::jsonb,
+                       updated_at = %s
+                   WHERE account = %s AND created_at = %s""",
+                (patch, _now(), account, created_at),
+            )
+        else:
+            conn.exec_driver_sql(
+                """UPDATE tasks
+                   SET image_url = JSON_MERGE_PATCH(
+                       COALESCE(NULLIF(image_url, ''), '{}'), %s),
+                       updated_at = %s
+                   WHERE account = %s AND created_at = %s""",
+                (patch, _now(), account, created_at),
+            )
+
+
+def set_task_error(account: str, created_at: str, error: str):
+    """记录任务级首条错误（仅在该任务还没有 error 时写入），并刷新心跳"""
     with get_write_conn() as conn:
         conn.exec_driver_sql(
-            _q("""UPDATE tasks SET completed_count = ?, status = ?, updated_at = ? WHERE id = ?"""),
-            (completed, status, _now(), task_id),
+            _q("""UPDATE tasks SET error = ?, updated_at = ?
+               WHERE account = ? AND created_at = ? AND (error IS NULL OR error = '')"""),
+            (error, _now(), account, created_at),
         )
 
 
-def update_task_result(task_id: int, seq: int, status: str,
-                       image_path: str = "", image_url: str = "",
-                       error: str = "", prompt: str = ""):
-    """更新子任务结果"""
+def update_task_status(account: str, created_at: str, status: str):
+    """更新任务状态（同时刷新 updated_at，供看门狗判断任务是否停滞）"""
     with get_write_conn() as conn:
         conn.exec_driver_sql(
-            _q("""UPDATE task_results SET status = ?, image_path = ?, image_url = ?,
-               error = ?, prompt = ? WHERE task_id = ? AND seq = ?"""),
-            (status, image_path, image_url, error, prompt, task_id, seq),
+            _q("""UPDATE tasks SET status = ?, updated_at = ?
+               WHERE account = ? AND created_at = ?"""),
+            (status, _now(), account, created_at),
         )
+
+
+def update_task_status_if_running(account: str, created_at: str, status: str) -> bool:
+    """仅当任务仍处于 running 时更新状态（看门狗接管用，避免覆盖刚结束的任务）
+
+    返回是否成功接管（任务还是 running 并已改为新状态）
+    """
+    with get_write_conn() as conn:
+        cur = conn.exec_driver_sql(
+            _q("""UPDATE tasks SET status = ?, updated_at = ?
+               WHERE account = ? AND created_at = ? AND status = 'running'"""),
+            (status, _now(), account, created_at),
+        )
+        return cur.rowcount > 0
+
+
+def claim_pending_task(account: str, created_at: str) -> bool:
+    """仅当任务仍处于 pending 时原子地标记为 running（执行接口认领用）
+
+    并发双击 / 重复请求时只有一个请求能认领成功，防止重复扣费重复执行。
+    """
+    with get_write_conn() as conn:
+        cur = conn.exec_driver_sql(
+            _q("""UPDATE tasks SET status = 'running', updated_at = ?
+               WHERE account = ? AND created_at = ? AND status = 'pending'"""),
+            (_now(), account, created_at),
+        )
+        return cur.rowcount > 0
 
 
 def list_incomplete_tasks() -> list:
     """获取所有未完成任务（running / pending），服务启动时恢复执行用"""
-    return _read_all(
-        "SELECT * FROM tasks WHERE status IN ('running', 'pending') ORDER BY id"
+    rows = _read_all(
+        "SELECT * FROM tasks WHERE status IN ('running', 'pending') ORDER BY created_at"
     )
+    return [_alias_task(r) for r in rows]
 
 
 def list_stalled_running_tasks(stall_seconds: int) -> list:
@@ -453,12 +530,13 @@ def list_stalled_running_tasks(stall_seconds: int) -> list:
 # ============================================================
 # 扣费记录（写入任务表 amount/remark，支持负数退款）
 # ============================================================
-def record_deduction(user_id: int, task_id: int, amount: int, remark: str = ""):
+def record_deduction(account: str, created_at: str, amount: int, remark: str = ""):
     """记录扣费（累加到任务的 amount 上）"""
     with get_write_conn() as conn:
         conn.exec_driver_sql(
-            _q("UPDATE tasks SET amount = COALESCE(amount, 0) + ?, remark = ? WHERE id = ?"),
-            (amount, remark, task_id),
+            _q("""UPDATE tasks SET amount = COALESCE(amount, 0) + ?, remark = ?
+               WHERE account = ? AND created_at = ?"""),
+            (amount, remark, account, created_at),
         )
 
 
@@ -466,8 +544,9 @@ def get_user_deductions(user_id: int, page: int = 1, page_size: int = 20) -> lis
     """获取用户扣费记录（从任务表读取有扣费/退款的任务）"""
     offset = (page - 1) * page_size
     return _read_all(
-        """SELECT id AS task_id, user_id, amount, remark, created_at
-           FROM tasks WHERE user_id = ? AND amount != 0
+        """SELECT account, amount, remark, created_at
+           FROM tasks WHERE account = (SELECT account FROM users WHERE id = ?)
+             AND amount != 0
            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
         (user_id, page_size, offset),
     )
@@ -476,8 +555,17 @@ def get_user_deductions(user_id: int, page: int = 1, page_size: int = 20) -> lis
 def list_all_users() -> list:
     """获取全部用户（管理员用）"""
     return _read_all(
-        "SELECT id, account, balance, created_at FROM users ORDER BY id"
+        f"SELECT id, account, balance, {_CHANGE_COL}, created_at FROM users ORDER BY id"
     )
+
+
+def set_user_change(user_id: int, change: int):
+    """设置用户分组数字（与供应商的 change 数字相等才匹配使用）"""
+    with get_write_conn() as conn:
+        conn.exec_driver_sql(
+            _q(f"UPDATE users SET {_CHANGE_COL} = ? WHERE id = ?"),
+            (int(change), user_id),
+        )
 
 
 # ============================================================
@@ -488,9 +576,18 @@ def list_api_providers() -> list:
     return _read_all("SELECT * FROM api_providers ORDER BY priority, id")
 
 
-def list_enabled_providers() -> list:
-    """获取启用的供应商（引擎调用用）"""
-    return _read_all("SELECT * FROM api_providers WHERE enabled = 1 ORDER BY priority, id")
+def list_enabled_providers(change: int = None) -> list:
+    """获取启用的供应商（引擎调用用）
+
+    change 不为 None 时按分组过滤：只返回 change 数字与用户一致的供应商。
+    """
+    sql = "SELECT * FROM api_providers WHERE enabled = 1"
+    params = []
+    if change is not None:
+        sql += f" AND {_CHANGE_COL} = ?"
+        params.append(int(change))
+    sql += " ORDER BY priority, id"
+    return _read_all(sql, tuple(params))
 
 
 def get_api_provider(provider_id: int) -> dict:
@@ -498,27 +595,29 @@ def get_api_provider(provider_id: int) -> dict:
 
 
 def create_api_provider(name: str, api_key: str, base_url: str, model: str = "",
-                        enabled: int = 1, priority: int = 0) -> int:
-    """新增供应商，返回 id"""
-    now = _now()
+                        enabled: int = 1, priority: int = 0,
+                        change: int = 0) -> int:
+    """新增供应商，返回 id（change 为分组数字，与用户的 change 相等才匹配）"""
     with get_write_conn() as conn:
         return _insert_id(
             conn,
-            """INSERT INTO api_providers
-               (name, api_key, base_url, model, enabled, priority, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (name, api_key, base_url, model, enabled, priority, now, now),
+            f"""INSERT INTO api_providers
+               (name, api_key, base_url, model, enabled, priority, {_CHANGE_COL})
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (name, api_key, base_url, model, enabled, priority, int(change)),
         )
 
 
 def update_api_provider(provider_id: int, name: str, api_key: str, base_url: str,
-                        model: str = "", enabled: int = 1, priority: int = 0):
+                        model: str = "", enabled: int = 1, priority: int = 0,
+                        change: int = 0):
     """更新供应商信息"""
     with get_write_conn() as conn:
         conn.exec_driver_sql(
-            _q("""UPDATE api_providers SET name = ?, api_key = ?, base_url = ?,
-               model = ?, enabled = ?, priority = ?, updated_at = ? WHERE id = ?"""),
-            (name, api_key, base_url, model, enabled, priority, _now(), provider_id),
+            _q(f"""UPDATE api_providers SET name = ?, api_key = ?, base_url = ?,
+               model = ?, enabled = ?, priority = ?, {_CHANGE_COL} = ? WHERE id = ?"""),
+            (name, api_key, base_url, model, enabled, priority,
+             int(change), provider_id),
         )
 
 
@@ -532,6 +631,6 @@ def set_api_provider_enabled(provider_id: int, enabled: int):
     """启用/停用供应商"""
     with get_write_conn() as conn:
         conn.exec_driver_sql(
-            _q("UPDATE api_providers SET enabled = ?, updated_at = ? WHERE id = ?"),
-            (1 if enabled else 0, _now(), provider_id),
+            _q("UPDATE api_providers SET enabled = ? WHERE id = ?"),
+            (1 if enabled else 0, provider_id),
         )

@@ -330,13 +330,14 @@
             : (task.batch ? `批量 ${refCount} 张` : `${refCount} 张`))
         : '无';
       sizeEl.textContent = task.size;
-      nEl.textContent = task.n;
+      nEl.textContent = (task.completed_count || 0) + ' 张';
       statusEl.className = `status-badge status-${task.status}`;
       statusEl.textContent = statusText(task.status);
 
-      const pct = task.total_count > 0 ? (task.completed_count / task.total_count * 100) : 0;
-      progressText.textContent = `${task.completed_count} / ${task.total_count}`;
-      progressFill.style.width = pct + '%';
+      const done = task.completed_count || 0;
+      const running = ['pending', 'running'].includes(task.status);
+      progressText.textContent = running ? `${done} 张生成中…` : `${done} 张`;
+      progressFill.style.width = running ? '60%' : (done > 0 ? '100%' : '0%');
 
       await loadResults();
     }
@@ -346,24 +347,28 @@
         const resp = await api.getTaskResults(taskId);
         const results = resp.results || resp || [];
         if (!cachedTask) return;
-        const total = cachedTask.total_count;
-        const items = [];
-
-        for (let i = 1; i <= total; i++) {
-          const r = results.find(x => x.seq === i);
-          items.push(r || { seq: i, status: 'pending' });
+        // 结果只包含已成功生成的图；运行中且还没有任何结果时显示整体加载占位
+        let items = results;
+        if (items.length === 0 && ['pending', 'running'].includes(cachedTask.status)) {
+          items = [{ seq: 1, status: 'pending' }];
         }
 
         // 先渲染（已缓存的图直接显示；未缓存的显示占位，下载完成后填充）
+        // 文件名去重：AI 平台 URL 末段可能同名（如都是 0.png），
+        // 重名会让 ZIP 打包互相覆盖（压缩包只剩一张）、单张下载文件名冲突，
+        // 冲突时加序号前缀保证唯一
+        const usedNames = new Set();
         resultGrid.innerHTML = items.map((r, idx) => {
           if (r.status === 'success' && (r.image_path || r.image_url)) {
             const url = blobCache.get(`${taskId}:${r.seq}`) || '';
             // 文件名：URL 模式下从 image_url 末段取；data URL / 本地模式回退到序号名
-            const filename = r.image_path
+            let filename = r.image_path
               ? r.image_path.split(/[\\/]/).pop()
               : (r.image_url.startsWith('data:')
                   ? `result_${r.seq}.png`
                   : (r.image_url.split('/').pop().split('?')[0] || `result_${r.seq}.png`));
+            if (usedNames.has(filename)) filename = `${r.seq}_${filename}`;
+            usedNames.add(filename);
             return `
               <div class="result-card" data-seq="${r.seq}">
                 <div class="result-image"${url ? ` data-url="${url}"` : ''}>
@@ -477,9 +482,10 @@
           const task = await api.getTask(taskId);
           const wasRunning = cachedTask && ['pending', 'running'].includes(cachedTask.status);
           cachedTask = task;
-          const pct = task.total_count > 0 ? (task.completed_count / task.total_count * 100) : 0;
-          progressText.textContent = `${task.completed_count} / ${task.total_count}`;
-          progressFill.style.width = pct + '%';
+          const done = task.completed_count || 0;
+          const running = ['pending', 'running'].includes(task.status);
+          progressText.textContent = running ? `${done} 张生成中…` : `${done} 张`;
+          progressFill.style.width = running ? '60%' : (done > 0 ? '100%' : '0%');
           statusEl.className = `status-badge status-${task.status}`;
           statusEl.textContent = statusText(task.status);
 

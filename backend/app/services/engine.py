@@ -91,17 +91,19 @@ def _apply_env_override(provider: dict) -> dict:
     return merged
 
 
-def _load_providers() -> list:
+def _load_providers(change: int = None) -> list:
     """加载所有可用 API 供应商配置。
 
     优先从数据库 api_providers 表读取（Web 平台管理）；数据库不可用或为空时
     回退到 config.env / config-*.env 文件（CLI 首次运行等场景）。
+    change 不为 None 时只返回与用户线路分组一致的供应商（用户的 change 与
+    供应商的 change 相等才匹配）。
     敏感配置仍可被系统环境变量覆盖（生产 systemd EnvironmentFile 注入）。
     """
     # ---- 优先：数据库（Web 平台已 init_db + 种子迁移）----
     try:
         from app.db.database import list_enabled_providers
-        rows = list_enabled_providers()
+        rows = list_enabled_providers(change)
         if rows:
             providers = []
             for r in rows:
@@ -200,9 +202,9 @@ def _forget_provider_if_matched(name: str):
             pass
 
 
-def _get_provider_order() -> list:
+def _get_provider_order(change: int = None) -> list:
     """返回供应商尝试顺序：记忆的排最前，其次 config.env，其余按文件顺序。"""
-    providers = _load_providers()
+    providers = _load_providers(change)
     remembered = _get_remembered_provider()
     if remembered:
         for i, p in enumerate(providers):
@@ -411,7 +413,8 @@ def call_image_edit(provider: dict, prompt: str, reference_images: list, n: int,
 # ============================================================
 def process_single_task(prompt: str, reference_images: list,
                         size: str, n: int,
-                        response_format: str = "url") -> dict:
+                        response_format: str = "url",
+                        change: int = 0) -> dict:
     """
     处理单个生成任务。
 
@@ -421,6 +424,7 @@ def process_single_task(prompt: str, reference_images: list,
         size: 图片尺寸（必传，由 Web/CLI 调用方决定）
         n: 生成数量（必传，由 Web/CLI 调用方决定）
         response_format: 返回格式
+        change: 用户线路分组（与供应商的 change 相等才匹配使用）
 
     返回:
         {
@@ -443,9 +447,9 @@ def process_single_task(prompt: str, reference_images: list,
     refs = reference_images or []
     is_edit = len(refs) > 0
 
-    # 多 API 自动切换：依次尝试所有供应商，哪个成功就用哪个（并记住它）
+    # 多 API 自动切换：依次尝试所有匹配线路的供应商，哪个成功就用哪个（并记住它）
     errors = []
-    for provider in _get_provider_order():
+    for provider in _get_provider_order(change):
         # 网络层异常（代理断连等）自动重试 1 次：中转站波动时第二次往往能拿到真实业务响应
         for attempt in range(2):
             try:

@@ -3,20 +3,25 @@
 ============================================
 后台任务在独立线程中执行（daemon 线程），进度与结果持久化到数据库。
 服务启动时自动恢复未完成任务；看门狗线程兜底处理停滞的 running 任务。
+
+任务定位：account + created_at（对外 id = created_at）。
 """
 
 import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, HTTPException
 
 from app.schemas.schemas import TaskCreateRequest
-from app.core.config import COST_PER_IMAGE, TASK_STALL_TIMEOUT
+from app.core.config import COST_PER_IMAGE, TASK_STALL_TIMEOUT, AI_MAX_CONCURRENCY
 from app.db.database import (
-    create_task, get_user_tasks, get_task_by_id, get_task_results,
+    create_task, get_user_tasks, get_task_by_key, get_task_results,
+    get_user_by_account,
     deduct_balance, add_balance, record_deduction,
-    update_task_progress, update_task_result,
+    update_task_status, update_task_status_if_running, claim_pending_task,
+    set_task_image_url, set_task_error,
     list_incomplete_tasks, list_stalled_running_tasks,
 )
 from app.api.deps import current_user
@@ -62,22 +67,65 @@ def _resolve_size(size: str) -> str:
     return SIZE_MAP.get(size, size)  # 未知值原样传给平台
 
 
+def _user_id_by_account(account: str):
+    """按账号取 user_id（余额扣退仍以 users.id 计），用户已删除时返回 None"""
+    u = get_user_by_account(account)
+    return u["id"] if u else None
+
+
+def _user_change(account: str) -> int:
+    """按账号取用户分组数字（change），与供应商 change 相等才匹配使用"""
+    u = get_user_by_account(account)
+    return int(u.get("change") or 0) if u else 0
+
+
 # ============================================================
 # 后台任务执行
 # ============================================================
-def _run_task_background(task_id: int, prompt: str, ref_image: str,
-                          shared_image: str, size: str, n: int,
-                          user_id: int, batch: int = 0):
+# 全局 AI 调用并发闸门：所有任务的所有子任务共享这 AI_CONC 个额度，
+# 防止大批量任务 / 多任务同时执行瞬间打满供应商限流和 frp 代理
+AI_CONC = max(1, AI_MAX_CONCURRENCY)
+_gen_semaphore = threading.Semaphore(AI_CONC)
+
+
+def _refund_ungenerated(account: str, created_at: str) -> int:
+    """退还"已扣费但未生成"的额度：净扣费(amount) - 已成功张数 * 单价。
+
+    以任务表 amount（净扣费）为准，退还后 amount 同步减少，
+    工作线程与看门狗任意时点调用都不会重复退款。返回实际退还数额。
+    """
+    task = get_task_by_key(account, created_at)
+    if not task:
+        return 0
+    amount = task.get("amount") or 0
+    generated = len(get_task_results(account, created_at))
+    refund = amount - generated * COST_PER_IMAGE
+    if refund <= 0:
+        return 0
+    uid = _user_id_by_account(account)
+    if uid is None:
+        return 0
+    add_balance(uid, refund)
+    record_deduction(account, created_at, -refund, "未生成部分退还")
+    return refund
+
+
+def _run_task_background(account: str, created_at: str, prompt: str,
+                         ref_image: str, shared_image: str, size: str,
+                         n: int, batch: int = 0):
     """后台任务执行（在独立线程中运行）
 
     batch=1（批量模式）：每张批量图独立生成 1 张，子任务数 = 批量图数量；
       shared_image（共用参考图）会附加到每张批量图后面一起送模型，
       例如批量图是"老人+护工"、共用参考图是两件衣服，提示词描述换装，
       每张批量图都会与这两件衣服一起编辑生成。
-    否则（默认）：所有参考图合成后生成 n 张。
-    任务结束后自动删除上传的参考图临时文件。
+    否则（默认）：所有参考图合成后生成 n 张（n 仅在本次执行期间使用，不入库）。
     """
+    seq_count = 0
     try:
+        # 用户线路分组：任务执行期间固定，与供应商 change 匹配
+        user_change = _user_change(account)
+
         # 解析参考图列表（逗号分隔）；文生图（无参考图）时保持空列表
         ref_list = []
         if ref_image and ref_image.strip():
@@ -102,59 +150,61 @@ def _run_task_background(task_id: int, prompt: str, ref_image: str,
             gen_prompt = f"{prompt}，{RATIO_HINTS[size]}。"
 
         # 恢复场景：跳过已成功的子任务，避免重复调用 AI 重复扣供应商费用
-        done_seqs = {r["seq"] for r in get_task_results(task_id)
-                     if r.get("status") == "success"}
+        done_seqs = {r["seq"] for r in get_task_results(account, created_at)}
 
         completed = 0
-        first_error = ""
-        for seq in range(1, seq_count + 1):
-            if seq in done_seqs:
-                completed += 1
-                continue
+        progress_lock = threading.Lock()
+        pending_seqs = [seq for seq in range(1, seq_count + 1) if seq not in done_seqs]
+        completed += (seq_count - len(pending_seqs))
+
+        def _generate_one(seq: int):
+            nonlocal completed
             # 批量模式：每个子任务用对应的 1 张批量图 + 全部共用参考图；
             # 普通模式：所有参考图一起送模型
             refs_for_seq = ([ref_list[seq - 1]] if (batch and ref_list) else list(ref_list)) + shared_list
-            result = process_single_task(
-                prompt=gen_prompt,
-                reference_images=refs_for_seq,
-                size=platform_size,
-                n=1,
-            )
+            # 全局并发闸门：等待拿到额度后才发起 AI 调用
+            with _gen_semaphore:
+                result = process_single_task(
+                    prompt=gen_prompt,
+                    reference_images=refs_for_seq,
+                    size=platform_size,
+                    n=1,
+                    change=user_change,
+                )
 
             if result["status"] == "success":
-                image_path = ""  # 纯 URL / data URL 模式，不本地落地
                 image_url = result["image_urls"][0] if result["image_urls"] else ""
-                update_task_result(task_id, seq, "success",
-                                   image_path=image_path,
-                                   image_url=image_url,
-                                   prompt=prompt)
-                completed += 1
+                if image_url:
+                    set_task_image_url(account, created_at, seq, image_url)
             else:
-                update_task_result(task_id, seq, "failed",
-                                   error=result["error"])
-                if not first_error:
-                    first_error = result["error"]
+                set_task_error(account, created_at, result["error"])
 
-            update_task_progress(task_id, completed)
+            with progress_lock:
+                if result["status"] == "success":
+                    completed += 1
+
+        # 任务内并行：单任务最多 AI_CONC 个线程，跨任务总量由 _gen_semaphore 兜底
+        with ThreadPoolExecutor(
+                max_workers=min(max(1, len(pending_seqs)), AI_CONC)) as pool:
+            futures = [pool.submit(_generate_one, seq) for seq in pending_seqs]
+            for f in futures:
+                f.result()
 
         if completed == 0:
-            # 全部失败：退还扣费并标记为 failed（不进历史任务列表）
-            cost = seq_count * COST_PER_IMAGE
-            add_balance(user_id, cost)
-            record_deduction(user_id, task_id, -cost,
-                             f"生成失败退还: {first_error[:100]}")
-            update_task_progress(task_id, 0, "failed")
+            # 全部失败：退还全部净扣费并标记为 failed（不进历史任务列表）
+            _refund_ungenerated(account, created_at)
+            update_task_status(account, created_at, "failed")
         else:
+            # 先退还未生成部分的费用，再定最终状态
+            _refund_ungenerated(account, created_at)
             status = "completed" if completed == seq_count else "partial"
-            update_task_progress(task_id, completed, status)
+            update_task_status(account, created_at, status)
 
-    except Exception as e:
-        # 异常也按全失败处理
+    except Exception:
+        # 异常也按失败处理：退还未生成部分
         try:
-            cost = seq_count * COST_PER_IMAGE
-            add_balance(user_id, cost)
-            record_deduction(user_id, task_id, -cost, f"生成异常退还: {str(e)[:100]}")
-            update_task_progress(task_id, 0, "failed")
+            _refund_ungenerated(account, created_at)
+            update_task_status(account, created_at, "failed")
         except Exception:
             pass
     # 参考图由前端负责删除：参考图被移除 / 会话结束时调用 DELETE /api/upload 立即删除
@@ -168,25 +218,44 @@ def resume_incomplete_tasks():
 
     - running：已扣费，直接续跑（跳过已成功的子任务）；
     - pending：创建后未执行，先扣费再跑；余额不足则标记失败。
+
+    批量模式张数 = 参考图数量；普通模式张数 = 已完成张数 + 1
+    （n 不入库，重启后按已有结果估算续跑，保证不丢已扣费用对应的结果）。
     """
+    from app.db.database import _parse_image_url_map
     for task in list_incomplete_tasks():
-        task_id = task["id"]
-        user_id = task["user_id"]
-        cost = task.get("total_count") or task.get("n", 1)
+        account = task["account"]
+        created_at = task["created_at"]
+        ref_list = [x for x in (task["reference_image"] or "").split(",") if x.strip()]
+        batch = task.get("batch", 0)
+        if batch and ref_list:
+            n = 1
+            seq_count = len(ref_list)
+        else:
+            batch = 0
+            done = len(_parse_image_url_map(task))
+            n = done + 1
+            seq_count = n
+
+        cost = seq_count * COST_PER_IMAGE
+        uid = _user_id_by_account(account)
+        if uid is None:
+            update_task_status(account, created_at, "failed")
+            continue
 
         if task["status"] == "pending":
-            if not deduct_balance(user_id, cost):
-                update_task_progress(task_id, 0, "failed")
-                record_deduction(user_id, task_id, 0, "恢复执行失败：余额不足")
+            if not deduct_balance(uid, cost):
+                update_task_status(account, created_at, "failed")
+                record_deduction(account, created_at, 0, "恢复执行失败：余额不足")
                 continue
-            record_deduction(user_id, task_id, cost, f"批量生成 {cost} 张（恢复执行）")
-            update_task_progress(task_id, 0, "running")
+            record_deduction(account, created_at, cost, f"批量生成 {cost} 张（恢复执行）")
 
+        update_task_status(account, created_at, "running")
         threading.Thread(
             target=_run_task_background,
-            args=(task_id, task["prompt"], task["reference_image"],
+            args=(account, created_at, task["prompt"], task["reference_image"],
                   task.get("shared_reference_image") or "",
-                  task["size"], task["n"], user_id, task.get("batch", 0)),
+                  task["size"], n, batch),
             daemon=True,
         ).start()
 
@@ -194,22 +263,25 @@ def resume_incomplete_tasks():
 def _stall_watchdog_loop():
     """看门狗线程：周期性检查停滞的 running 任务。
 
-    单次 AI 调用最长 DEFAULT_TIMEOUT(300s)，每个子任务结束都会刷新进度，
-    因此超过 TASK_STALL_TIMEOUT（默认 15 分钟）无进度的 running 任务基本
-    已卡死（线程被杀等），标记失败并把已扣费用退还给用户。
+    单次 AI 调用最长 DEFAULT_TIMEOUT(300s)，每张图成功/失败都会刷新
+    updated_at（心跳），因此超过 TASK_STALL_TIMEOUT（默认 15 分钟）无任何
+    进度的 running 任务基本已卡死（线程被杀等）。此时按"已扣费但未生成"
+    的张数退还额度（已生成的不退），一张没生成标记 failed，有部分生成
+    标记 partial。
     """
     last_cleanup = 0.0
     while True:
         time.sleep(60)
         try:
             for task in list_stalled_running_tasks(TASK_STALL_TIMEOUT):
-                task_id = task["id"]
-                user_id = task["user_id"]
-                cost = task.get("amount") or (task.get("total_count") or 0) * COST_PER_IMAGE
-                if cost > 0:
-                    add_balance(user_id, cost)
-                    record_deduction(user_id, task_id, -cost, "生成超时失败退还")
-                update_task_progress(task_id, task.get("completed_count", 0), "failed")
+                account = task["account"]
+                created_at = task["created_at"]
+                has_image = len(get_task_results(account, created_at)) > 0
+                # 条件接管：仅当任务仍是 running 时改状态，避免覆盖刚完成的任务
+                if not update_task_status_if_running(
+                        account, created_at, "partial" if has_image else "failed"):
+                    continue
+                _refund_ungenerated(account, created_at)
         except Exception:
             continue
         # 兜底清扫：每 10 分钟扫一次 uploads 残留参考图（前端漏删/会话异常时兜底）
@@ -281,32 +353,30 @@ def create_batch_task(req: TaskCreateRequest, user: dict = current_user):
         raise HTTPException(status_code=402, detail=f"余额不足，需要 {cost} 次，当前余额 {user['balance']} 次")
 
     # 创建任务记录
-    task_id = create_task(
-        user_id=user["id"],
+    created_at = create_task(
+        account=user["account"],
         prompt=prompt,
         reference_image=ref_image,
         shared_reference_image=shared_image,
         size=req.size,
-        n=n,
-        total_count=total_count,
         batch=1 if req.batch else 0,
     )
 
     # 扣费
     deduct_balance(user["id"], cost)
-    record_deduction(user["id"], task_id, cost, f"批量生成 {total_count} 张")
+    record_deduction(user["account"], created_at, cost, f"批量生成 {total_count} 张")
 
     # 自动执行后台线程
-    update_task_progress(task_id, 0, "running")
+    update_task_status(user["account"], created_at, "running")
     threading.Thread(
         target=_run_task_background,
-        args=(task_id, prompt, ref_image, shared_image, req.size, n,
-              user["id"], req.batch),
+        args=(user["account"], created_at, prompt, ref_image, shared_image,
+              req.size, n, req.batch),
         daemon=True,
     ).start()
 
     return {
-        "task_id": task_id,
+        "task_id": created_at,
         "total_count": total_count,
         "cost": cost,
         "balance_after": user["balance"] - cost,
@@ -317,70 +387,62 @@ def create_batch_task(req: TaskCreateRequest, user: dict = current_user):
 @router.get("/api/tasks")
 def list_tasks(page: int = 1, page_size: int = 20, user: dict = current_user):
     """获取用户任务列表"""
-    tasks = get_user_tasks(user["id"], page, page_size)
+    tasks = get_user_tasks(user["account"], page, page_size)
     return {"tasks": tasks, "page": page, "page_size": page_size}
 
 
-@router.get("/api/tasks/{task_id}")
-def get_task(task_id: int, user: dict = current_user):
+@router.get("/api/tasks/{created_at}")
+def get_task(created_at: str, user: dict = current_user):
     """获取任务详情"""
-    task = get_task_by_id(task_id)
+    task = get_task_by_key(user["account"], created_at)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    if task["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="无权访问该任务")
-    # 全部失败时附加第一个错误信息（用于前端展示）
-    if task["status"] == "failed" and task.get("completed_count", 0) == 0:
-        results = get_task_results(task_id)
-        first_fail = next((r for r in results if r["status"] == "failed"), None)
-        if first_fail:
-            task["error"] = first_fail.get("error", "")
     return task
 
 
-@router.get("/api/tasks/{task_id}/results")
-def get_task_results_api(task_id: int, user: dict = current_user):
+@router.get("/api/tasks/{created_at}/results")
+def get_task_results_api(created_at: str, user: dict = current_user):
     """获取任务生成结果"""
-    task = get_task_by_id(task_id)
+    task = get_task_by_key(user["account"], created_at)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    if task["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="无权访问该任务")
 
-    results = get_task_results(task_id)
+    results = get_task_results(user["account"], created_at)
     return {"task": task, "results": results}
 
 
-@router.post("/api/tasks/{task_id}/execute")
-def execute_task(task_id: int, user: dict = current_user):
+@router.post("/api/tasks/{created_at}/execute")
+def execute_task(created_at: str, user: dict = current_user):
     """执行任务（异步启动后台线程）"""
-    task = get_task_by_id(task_id)
+    task = get_task_by_key(user["account"], created_at)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    if task["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="无权操作该任务")
-    if task["status"] != "pending":
+
+    # 先原子认领（pending → running）：双击/并发重入时第二个请求认领失败，
+    # 从源头防止重复扣费重复执行
+    if not claim_pending_task(user["account"], created_at):
         raise HTTPException(status_code=400, detail="任务已执行，请查看结果")
 
-    # 先扣费
-    ref_image = task["reference_image"]
-    n = task["n"]
-    cost = task["total_count"]
+    # 再扣费（批量模式张数 = 参考图数量；普通模式 = 1 张）；失败则回滚认领
+    ref_list = [x for x in (task["reference_image"] or "").split(",") if x.strip()]
+    total_count = len(ref_list) if task.get("batch") and ref_list else 1
+    cost = total_count * COST_PER_IMAGE
 
     if not deduct_balance(user["id"], cost):
+        update_task_status(user["account"], created_at, "pending")
         raise HTTPException(status_code=402, detail="扣费失败，余额不足")
 
-    record_deduction(user["id"], task_id, cost, f"批量生成 {task['total_count']} 张")
-    update_task_progress(task_id, 0, "running")
+    record_deduction(user["account"], created_at, cost, f"批量生成 {total_count} 张")
 
     # 启动后台线程执行
+    n = 1 if task.get("batch") else total_count
     thread = threading.Thread(
         target=_run_task_background,
-        args=(task_id, task["prompt"], ref_image,
+        args=(user["account"], created_at, task["prompt"], task["reference_image"],
               task.get("shared_reference_image") or "",
-              task["size"], n, user["id"], task.get("batch", 0)),
+              task["size"], n, task.get("batch", 0)),
         daemon=True,
     )
     thread.start()
 
-    return {"message": "任务已启动执行", "task_id": task_id, "cost": cost}
+    return {"message": "任务已启动执行", "task_id": created_at, "cost": cost}

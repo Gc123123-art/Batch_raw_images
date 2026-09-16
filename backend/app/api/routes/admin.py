@@ -7,12 +7,13 @@ from fastapi import APIRouter, HTTPException
 
 from app.schemas.schemas import (
     RechargeRequest, UpdateBalanceRequest, DeleteUserRequest, ResetPasswordRequest,
+    SetUserChangeRequest,
     ProviderCreateRequest, ProviderUpdateRequest,
     ProviderToggleRequest, ProviderDeleteRequest,
 )
 from app.db.database import (
     get_user_by_id, add_balance, set_balance, delete_user, list_all_users,
-    change_password,
+    change_password, set_user_change,
     list_api_providers, get_api_provider, create_api_provider,
     update_api_provider, delete_api_provider, set_api_provider_enabled,
 )
@@ -84,6 +85,20 @@ def admin_reset_password(req: ResetPasswordRequest, _: str = admin_key):
     return {"message": f"用户 {user['account']} 的密码已重置", "user_id": req.user_id}
 
 
+@router.post("/api/admin/set_user_change")
+def admin_set_user_change(req: SetUserChangeRequest, _: str = admin_key):
+    """设置用户分组数字（users.change 与 api_providers.change 相等才匹配使用）"""
+    user = get_user_by_id(req.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if req.change < 0:
+        raise HTTPException(status_code=400, detail="change 不能为负数")
+
+    set_user_change(req.user_id, req.change)
+    return {"user_id": req.user_id, "change": req.change,
+            "message": f"用户 {user['account']} 分组已设为 {req.change}"}
+
+
 # ============================================================
 # API 供应商管理（数据库管理，替代 config-*.env 文件）
 # ============================================================
@@ -105,8 +120,7 @@ def _public_provider(row: dict) -> dict:
         "model": row["model"],
         "enabled": row["enabled"],
         "priority": row["priority"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
+        "change": int(row.get("change", 0)),
     }
 
 
@@ -133,6 +147,7 @@ def admin_create_provider(req: ProviderCreateRequest, _: str = admin_key):
         model=req.model.strip(),
         enabled=req.enabled,
         priority=req.priority,
+        change=req.change,
     )
     return {"message": "供应商已创建", "provider_id": pid}
 
@@ -158,6 +173,7 @@ def admin_update_provider(provider_id: int, req: ProviderUpdateRequest,
         model=req.model.strip(),
         enabled=req.enabled,
         priority=req.priority,
+        change=req.change,
     )
     return {"message": "供应商已更新", "provider_id": provider_id}
 

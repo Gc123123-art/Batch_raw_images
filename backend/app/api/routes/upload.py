@@ -16,8 +16,7 @@ from app.core.config import UPLOAD_DIR, PREVIEW_SIG_TTL
 from app.core.security import sign_preview_url, verify_preview_signature
 from app.api.deps import current_user
 from app.db.database import (
-    get_task_by_id,
-    get_task_result_by_seq,
+    get_task_by_key,
     list_incomplete_tasks,
 )
 
@@ -303,48 +302,35 @@ async def preview_upload_file(path: str = Query(...), expires: int = Query(0),
     return resp
 
 
-@router.get("/api/files/{task_id}/{seq}")
-def get_image(task_id: int, seq: int, user: dict = current_user):
-    """根据任务ID和序号提供生成的图片文件
+@router.get("/api/files/{created_at}/{seq}")
+def get_image(created_at: str, seq: int, user: dict = current_user):
+    """根据任务标识（created_at）和序号提供生成的图片文件
 
     加速策略（零服务器磁盘占用，缓存落在浏览器端）：
-    - 旧记录（存本地路径）：直接 FileResponse + 长缓存
     - 裁切记录（存 base64 data URL）：解码后直接返回 + 长缓存
-    - 新记录（存云端 URL）：流式代理转发，并加 Cache-Control 头，
+    - 云端 URL：流式代理转发，并加 Cache-Control 头，
       让浏览器本地缓存代理结果 —— 同一浏览器再次访问秒开，
       且不消耗服务器磁盘（AI 平台 URL 过期前访问过一次即永久可用）
     """
-    from fastapi.responses import FileResponse, StreamingResponse
+    from fastapi.responses import StreamingResponse
     import requests
+    from app.db.database import _parse_image_url_map
 
-    # 权限检查
-    task = get_task_by_id(task_id)
+    # 权限检查（任务属于当前登录账号）
+    task = get_task_by_key(user["account"], created_at)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    if task["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="无权访问该任务")
 
-    # 单条查询（消除 N+1，不查全表）
-    target = get_task_result_by_seq(task_id, seq)
-    if not target:
+    image_url = _parse_image_url_map(task).get(seq, "")
+    if not image_url:
         raise HTTPException(status_code=404, detail="图片不存在")
 
-    # 1) 旧记录：本地文件
-    if target.get("image_path"):
-        file_path = Path(target["image_path"])
-        if file_path.exists() and file_path.is_file():
-            response = FileResponse(str(file_path))
-            response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Cache-Control"] = "public, max-age=86400"
-            return response
-
-    # 2) 裁切结果存的是 base64 data URL（不落盘，直接解码返回）
-    if target.get("image_url", "").startswith("data:image/"):
+    # 1) 裁切结果存的是 base64 data URL（不落盘，直接解码返回）
+    if image_url.startswith("data:image/"):
         try:
             import base64
             from fastapi.responses import Response
-            header, _, b64data = target["image_url"].partition(",")
+            header, _, b64data = image_url.partition(",")
             content_type = header[5:].split(";")[0] or "image/png"
             img_bytes = base64.b64decode(b64data)
             response = Response(content=img_bytes, media_type=content_type)
@@ -356,21 +342,17 @@ def get_image(task_id: int, seq: int, user: dict = current_user):
         except Exception:
             raise HTTPException(status_code=502, detail="图片数据解析失败")
 
-    # 3) 新记录：代理云端 URL（浏览器端缓存，不落服务器磁盘）
-    if target.get("image_url"):
-        try:
-            resp = requests.get(target["image_url"], stream=True, timeout=60)
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "image/png")
-            response = StreamingResponse(resp.iter_content(chunk_size=8192),
-                                         media_type=content_type)
-            # 浏览器缓存 24 小时：第二次访问直接命中浏览器本地缓存，秒开
-            response.headers["Cache-Control"] = "public, max-age=86400"
-            response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            return response
-        except requests.exceptions.RequestException:
-            raise HTTPException(status_code=502, detail="云端图片暂时无法访问")
-
-    # 3) 没有可用数据
-    raise HTTPException(status_code=404, detail="图片不存在")
+    # 2) 云端 URL：流式代理转发（浏览器端缓存，不落服务器磁盘）
+    try:
+        resp = requests.get(image_url, stream=True, timeout=60)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "image/png")
+        response = StreamingResponse(resp.iter_content(chunk_size=8192),
+                                     media_type=content_type)
+        # 浏览器缓存 24 小时：第二次访问直接命中浏览器本地缓存，秒开
+        response.headers["Cache-Control"] = "public, max-age=86400"
+        response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=502, detail="云端图片暂时无法访问")
