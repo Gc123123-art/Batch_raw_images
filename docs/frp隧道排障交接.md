@@ -1,7 +1,7 @@
 # BOLI AI Linux 迁移 & frp 隧道排障记录
 
 > 用于新对话接手时的上下文快照
-> 截止时间：2026-08-23
+> 截止时间：2026-09-17（新增第九节：frpc 僵尸连接故障案例）
 
 ---
 
@@ -164,6 +164,7 @@ curl --proxy http://127.0.0.1:8899 https://xibapi.com/v1/models
 - [x] 申请 SSL 证书（已用 acme.sh 申请，详见第八节）
 - [x] 验证 systemd `boli-backend` 服务（后端守护）正常运行（崩溃模拟测试通过，看门狗 8 秒内拉起新进程）
 - [ ] 阿里云安全组入方向放行 TCP:7000（**已通过 frpc 成功连上 frps 隐式验证通过**，但建议在阿里云控制台再确认下安全组规则）
+- [ ] **家庭电脑加 frpc 看门狗计划任务**（每 10 分钟检测隧道连通性，不通自动重启 frpc；防 2026-09-17 僵尸连接故障复发，详见第九节）
 
 ---
 
@@ -357,3 +358,114 @@ echo | openssl s_client -connect ai.legouhou.cn:443 -servername ai.legouhou.cn 2
 - API Key 只能放后端，不能给前端
 - 改动要热部署
 - 用户对 PowerShell 兼容性问题敏感（之前出过 `unzip` 找不到、Select-String 找不到等坑）
+
+---
+
+## 九、故障案例：frpc 僵尸连接（2026-09-17 已修复）
+
+> 用户生图全部报"网络连接中断"，按本节流程 10 分钟内可定位修复。
+
+### 9.1 现象
+
+前端生成失败提示：
+
+```
+生成失败 [向量] 网络连接中断，请稍后重试; [小扳手] 网络连接中断，请稍后重试
+已自动退还本次额度，可修改提示词或参考图后重新生成重试
+```
+
+**同组所有供应商同时报"网络连接中断"= 99% 是隧道/代理链路问题，不是供应商问题**（供应商故障一般只有一家报错）。
+
+错误来源：`backend/app/services/engine.py` 的 `ConnectionError` 分支（重试 1 次后仍失败）。
+注意区分：报"代理连接异常"= ProxyError（连代理端口都失败，8899 没监听）；报"网络连接中断"= ConnectionError（代理端口通，但数据流过隧道时断了，**僵尸连接就是这种**）。
+
+### 9.2 重要：别查错电脑
+
+- frpc 和 proxy.py 跑在**家庭电脑**（192.168.1.38，`C:\frp\`），**不是**开发机（d:\code 那台）！
+- 开发机上查 `tasklist | findstr frpc` 永远是空的，别被误导
+- 开发机本地生图正常 ≠ 隧道正常（开发机直连中转站，不走隧道）
+
+### 9.3 快速定位流程（一次一条命令，按顺序）
+
+**第 1 步（家庭电脑 CMD）：两个进程活着吗**
+
+```bat
+tasklist | findstr frpc
+netstat -ano | findstr ":8899" | findstr LISTENING
+```
+
+两条都有输出 = 进程活着，继续第 2 步；哪条没输出 = 哪个进程挂了，用计划任务拉起（`schtasks /run /tn BOLI_Frpc` / `BOLI_Proxy`）。
+
+**第 2 步（家庭电脑 CMD）：frpc 和云端连着吗**
+
+```bat
+netstat -ano | findstr "8.137.70.163:7000" | findstr ESTABLISHED
+```
+
+有输出 = 连着（**但可能是僵尸，继续往下查**）；无输出 = frpc 没连上，直接重启 frpc（见 9.4）。
+
+**第 3 步（家庭电脑 CMD）：本机代理能出网吗**
+
+```bat
+curl -x http://127.0.0.1:8899 https://xibapi.com/v1/models
+```
+
+返回 `Invalid token ...` = 家庭电脑这一段全好（被业务层拦截 = 网络通）；报错/超时 = proxy.py 或家庭网络问题。
+
+**第 4 步（云服务器终端）：整条链路通吗**
+
+```bash
+curl --proxy http://127.0.0.1:8899 https://xibapi.com/v1/models
+```
+
+- 返回 `Invalid token ...` = 链路全通，问题在云后端（`systemctl restart boli-backend` 试试）
+- **`curl: (56) Recv failure: Connection reset by peer`** = 本次故障的经典表现：8899 有监听（proxy 注册还在）但隧道数据流不通 → **frpc 僵尸连接**，走 9.4 修复
+
+### 9.4 修复方法（本次生效的）
+
+**家庭电脑**上杀掉 frpc 并用计划任务重启：
+
+```bat
+:: PID 换成第 1 步查到的实际 PID
+taskkill /PID 15156 /F
+schtasks /run /tn BOLI_Frpc
+```
+
+**云服务器**复测（出现 `Invalid token` 即修复）：
+
+```bash
+curl --proxy http://127.0.0.1:8899 https://xibapi.com/v1/models
+```
+
+若重启 frpc 后仍 reset：先 `systemctl restart boli-frps`（云端），再重启 frpc（家庭电脑），再复测。还没好就按 3.3 查 token。
+
+### 9.5 根因分析
+
+frpc 到云服务器的控制连接是**长期保持的 TCP 连接**，中间经过家庭路由器 NAT、运营商设备、云防火墙。这些中间设备会**静默丢弃**看似空闲的长连接（不通知两端）。frpc 本该靠心跳察觉并重连，但遇到家里网络闪断、路由器重启、运营商 NAT 超时等情况，连接已死 frpc 却仍认为活着（netstat 显示 ESTABLISHED 但实际不通）——即"僵尸连接"。
+
+**特点**：
+- 随时可能发生一次，与用户量/并发无关，与家庭网络稳定性有关
+- frpc 进程不退出、端口照常监听、TCP 显示已连接，一切"看起来正常"
+- 只有实际走一遍流量（云端 curl）才能暴露
+
+### 9.6 预防措施（待办）
+
+在家庭电脑加**看门狗计划任务**（建议命名 `BOLI_FrpcGuard`，每 10 分钟运行）：
+
+```bat
+:: 检测隧道是否可用，不通就重启 frpc
+curl -s --max-time 20 -x http://127.0.0.1:8899 https://xibapi.com/v1/models | findstr "new_api_error" >nul
+if %errorlevel% neq 0 (
+    taskkill /im frpc.exe /f
+    schtasks /run /tn BOLI_Frpc
+)
+```
+
+> 原理：隧道正常时 curl 必返回含 `new_api_error` 的业务响应；20 秒超时或响应异常 = 隧道死 → 重启 frpc。文件放 `C:\frp\frpc_guard.bat`，计划任务每 10 分钟触发。
+> 远期（并发大了以后）：把"借家庭宽带出网"换成独立中转代理服务器，消除家庭宽带这个单点和上行带宽瓶颈。
+
+### 9.7 并发影响说明（用户问过）
+
+- 僵尸连接本身与并发无关（是长连接被中间设备静默掐断）
+- 并发真正的影响：所有云端生图请求共享家庭宽带上行，多人同时传参考图会占满上行 → 请求变慢/超时
+- 单点风险：frpc 一挂所有用户同时报错（本次即是），看门狗可把故障恢复时间从"人工发现"缩到 10 分钟内
