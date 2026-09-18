@@ -164,7 +164,7 @@ curl --proxy http://127.0.0.1:8899 https://xibapi.com/v1/models
 - [x] 申请 SSL 证书（已用 acme.sh 申请，详见第八节）
 - [x] 验证 systemd `boli-backend` 服务（后端守护）正常运行（崩溃模拟测试通过，看门狗 8 秒内拉起新进程）
 - [ ] 阿里云安全组入方向放行 TCP:7000（**已通过 frpc 成功连上 frps 隐式验证通过**，但建议在阿里云控制台再确认下安全组规则）
-- [ ] **家庭电脑加 frpc 看门狗计划任务**（每 10 分钟检测隧道连通性，不通自动重启 frpc；防 2026-09-17 僵尸连接故障复发，详见第九节）
+- [x] **家庭电脑加 frpc 看门狗计划任务**（`BOLI_FrpcGuard`，2026-09-18 已安装，每 3 分钟检测隧道连通性，不通自动重启 frpc；日志 `C:\frp\guard.log`，详见第九节 9.6）
 
 ---
 
@@ -193,8 +193,9 @@ curl --proxy http://127.0.0.1:8899 https://xibapi.com/v1/models
 |---|---|
 | frpc | `C:\frp\frpc.exe` |
 | frpc 配置 | `C:\frp\frpc.toml` |
+| frpc 看门狗脚本 | `C:\frp\frpc_guard.bat`（日志 `C:\frp\guard.log`） |
 | proxy.py | 全局 Python 包，启动命令含 `--timeout 900` |
-| 计划任务 | `BOLI_Frpc`、`BOLI_Proxy`、`BOLI_Watch` |
+| 计划任务 | `BOLI_Frpc`、`BOLI_Proxy`、`BOLI_Watch`、`BOLI_FrpcGuard`（每 3 分钟巡检隧道） |
 
 ---
 
@@ -448,20 +449,58 @@ frpc 到云服务器的控制连接是**长期保持的 TCP 连接**，中间经
 - frpc 进程不退出、端口照常监听、TCP 显示已连接，一切"看起来正常"
 - 只有实际走一遍流量（云端 curl）才能暴露
 
-### 9.6 预防措施（待办）
+### 9.6 预防措施（2026-09-18 已定稿：3 分钟巡检一次）
 
-在家庭电脑加**看门狗计划任务**（建议命名 `BOLI_FrpcGuard`，每 10 分钟运行）：
+> 为什么是 3 分钟：更短（1-2 分钟）会频繁重启 frpc，容易误伤正在生成中的请求；更长恢复太慢。3 分钟是恢复速度与稳定性的平衡点。
+
+**在家庭电脑（192.168.1.38）上执行，共 4 步：**
+
+第 1 步：打开 CMD，创建看门狗脚本
 
 ```bat
-:: 检测隧道是否可用，不通就重启 frpc
+notepad C:\frp\frpc_guard.bat
+```
+
+弹出"是否新建文件"点"是"，粘贴以下内容，`Ctrl+S` 保存后关闭记事本：
+
+```bat
+@echo off
 curl -s --max-time 20 -x http://127.0.0.1:8899 https://xibapi.com/v1/models | findstr "new_api_error" >nul
 if %errorlevel% neq 0 (
+    echo %date% %time% 隧道不通，重启frpc >> C:\frp\guard.log
     taskkill /im frpc.exe /f
     schtasks /run /tn BOLI_Frpc
 )
 ```
 
-> 原理：隧道正常时 curl 必返回含 `new_api_error` 的业务响应；20 秒超时或响应异常 = 隧道死 → 重启 frpc。文件放 `C:\frp\frpc_guard.bat`，计划任务每 10 分钟触发。
+第 2 步：创建计划任务（每 3 分钟运行一次）
+
+```bat
+schtasks /create /tn BOLI_FrpcGuard /tr "C:\frp\frpc_guard.bat" /sc minute /mo 3 /ru SYSTEM /rl HIGHEST /f
+```
+
+看到 `成功: 成功创建计划任务 "BOLI_FrpcGuard"。` 即成功。
+
+第 3 步：手动跑一次验证任务能执行
+
+```bat
+schtasks /run /tn BOLI_FrpcGuard
+```
+
+第 4 步：确认看门狗判定正常（无新增日志 = 健康）
+
+```bat
+type C:\frp\guard.log
+```
+
+显示"找不到文件"或无新记录 = 看门狗检测隧道正常、没有误判，安装完成。
+
+**日后运维**：
+- 查隧道断过几次：`type C:\frp\guard.log`（一行 = 一次自动修复）
+- 删除看门狗：`schtasks /delete /tn BOLI_FrpcGuard /f`
+- 若日志频繁出现重启记录（说明网络抖动误判多），把 `/mo 3` 改 `/mo 5` 重建
+
+> 原理：看门狗每 3 分钟借隧道访问一次中转站；隧道正常时 curl 返回含 `new_api_error` 的业务响应（findstr 命中 = 不动作）；20 秒超时或响应异常 = 隧道死 → 写日志并重启 frpc。
 > 远期（并发大了以后）：把"借家庭宽带出网"换成独立中转代理服务器，消除家庭宽带这个单点和上行带宽瓶颈。
 
 ### 9.7 并发影响说明（用户问过）
