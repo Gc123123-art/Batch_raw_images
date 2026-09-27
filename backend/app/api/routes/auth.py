@@ -3,7 +3,10 @@
 ==================================
 """
 
+import re
+
 from fastapi import APIRouter, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 
 from app.schemas.schemas import RegisterRequest, LoginRequest, ChangePasswordRequest
 from app.core.security import hash_password, verify_password, create_token
@@ -16,34 +19,50 @@ from app.api.deps import (
 
 router = APIRouter(tags=["auth"])
 
+_WHITESPACE_RE = re.compile(r"\s")
+
+
+def normalize_account(account: str) -> str:
+    """账号规范化：去掉首尾空白（内部含空白由调用方另行校验）"""
+    return (account or "").strip()
+
 
 @router.post("/api/auth/register")
 def register(req: RegisterRequest, request: Request):
-    """注册"""
+    """注册（账号区分大小写、不允许空格、不允许完全相同）"""
     check_login_limit(request)
-    if not req.account or not req.password:
+    account = normalize_account(req.account)
+    if not account or not req.password:
         raise HTTPException(status_code=400, detail="账号和密码不能为空")
+    if _WHITESPACE_RE.search(account):
+        raise HTTPException(status_code=400, detail="账号不能有空格")
     if len(req.password) < 6:
         raise HTTPException(status_code=400, detail="密码至少 6 位")
 
-    existing = get_user_by_account(req.account)
+    existing = get_user_by_account(account)
     if existing:
         record_login_failure(request)
         raise HTTPException(status_code=400, detail="该账号已注册")
 
     hashed = hash_password(req.password)
-    user_id = create_user(req.account, hashed)
-    token = create_token(user_id, req.account)
+    try:
+        user_id = create_user(account, hashed)
+    except IntegrityError:
+        # 并发注册兜底：数据库 UNIQUE 约束拦截，返回与查重一致的结果
+        record_login_failure(request)
+        raise HTTPException(status_code=400, detail="该账号已注册")
+    token = create_token(user_id, account)
 
-    return {"user_id": user_id, "account": req.account, "token": token,
+    return {"user_id": user_id, "account": account, "token": token,
             "balance": 0, "message": "注册成功，请联系管理员充值后使用"}
 
 
 @router.post("/api/auth/login")
 def login(req: LoginRequest, request: Request):
-    """登录"""
+    """登录（账号区分大小写）"""
     check_login_limit(request)
-    user = get_user_by_account(req.account)
+    account = normalize_account(req.account)
+    user = get_user_by_account(account)
     if not user or not verify_password(req.password, user["password"]):
         record_login_failure(request)
         raise HTTPException(status_code=401, detail="账号或密码错误")

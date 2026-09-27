@@ -18,7 +18,7 @@
       <form class="auth-form" id="registerForm">
         <div>
           <label for="account">账号</label>
-          <input type="text" id="account" class="input" placeholder="请输入账号（任意字符）" required minlength="3">
+          <input type="text" id="account" class="input" placeholder="请输入账号（不能有空格，区分大小写）" required minlength="3">
         </div>
         <div>
           <label for="password">密码</label>
@@ -61,6 +61,11 @@
       }
       if (account.length < 3) {
         errorBox.textContent = '账号至少 3 个字符';
+        errorBox.hidden = false;
+        return;
+      }
+      if (/\s/.test(account)) {
+        errorBox.textContent = '账号不能有空格';
         errorBox.hidden = false;
         return;
       }

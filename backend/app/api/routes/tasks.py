@@ -138,6 +138,16 @@ def _run_task_background(account: str, created_at: str, prompt: str,
         if batch and shared_image and shared_image.strip():
             shared_list = [x.strip() for x in shared_image.split(",") if x.strip()]
 
+        # 执行前复核参考图是否仍在（上传后可能被会话清理 / 兜底清扫删除）：
+        # 缺图直接失败并全额退款，不浪费供应商调用
+        missing = [p for p in (ref_list + shared_list) if not os.path.isfile(p)]
+        if missing:
+            set_task_error(account, created_at,
+                           f"参考图已失效，请重新上传：{', '.join(missing)}")
+            _refund_ungenerated(account, created_at)
+            update_task_status(account, created_at, "failed")
+            return
+
         # 子任务总数：批量模式 = 批量图数量，否则 = n
         seq_count = len(ref_list) if (batch and ref_list) else n
 
@@ -339,11 +349,12 @@ def create_batch_task(req: TaskCreateRequest, user: dict = current_user):
             raise HTTPException(status_code=400, detail="共用参考图仅用于批量模式")
         total_count = n
 
-    # 如果是图生图，校验参考图是否存在
-    if ref_image and not os.path.isfile(ref_image):
-        # 允许多张（逗号分隔），跳过单文件校验（在子任务执行时再校验）
-        if "," not in ref_image:
-            raise HTTPException(status_code=400, detail=f"参考图不存在: {ref_image}")
+    # 校验全部参考图存在（批量图 + 共用参考图，多张也逐个校验）：
+    # 上传后的文件可能被前端会话清理或后端兜底清扫删除，缺图必须当场拦住，不扣费
+    missing = [p for p in (ref_list + shared_list) if not os.path.isfile(p)]
+    if missing:
+        raise HTTPException(status_code=400,
+                            detail=f"参考图已失效，请重新上传：{', '.join(missing)}")
 
     # 计算扣费
     cost = total_count * COST_PER_IMAGE

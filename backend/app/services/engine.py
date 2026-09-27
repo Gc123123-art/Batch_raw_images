@@ -6,11 +6,11 @@ BOLI AI 批量图片生成 — 核心引擎
 """
 
 import os
+import io
 import json
 import time
 import mimetypes
 import threading
-import tempfile
 from datetime import datetime
 
 import requests
@@ -222,126 +222,53 @@ def _http_error_desc(status_code: int) -> str:
         return "API Key 无效"
     if status_code == 402:
         return "余额不足"
+    if status_code == 429:
+        return "请求过于频繁被限流（429），请降低并发或稍后重试"
     if status_code == 500:
         return "服务端内部错误"
     if status_code == 502:
         return "AI 生成服务暂时不可用（502），请稍后重试"
+    if status_code == 503:
+        return "服务暂时过载（503），请稍后重试"
     return f"HTTP {status_code}"
 
 
-# ============================================================
-# 工具函数
-# ============================================================
-def _try_load_font(size: int):
-    """尝试加载一个支持中文的系统字体；失败则降级到 PIL 默认字体。"""
-    if not HAS_PIL:
-        return None
-    from PIL import ImageFont
-    # 常见字体路径
-    candidates = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\msyh.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\arialbd.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]
-    for fp in candidates:
-        if os.path.isfile(fp):
-            try:
-                return ImageFont.truetype(fp, size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
+def _provider_tag(provider: dict) -> str:
+    """错误信息里的供应商标识：用数据库 id（如 [2]），不把供应商名称暴露给终端用户。
+    仅 env 文件回退场景（无 id）才退回名称。"""
+    pid = provider.get("id")
+    if pid is not None:
+        return str(pid)
+    return str(provider.get("name") or "env")
 
 
-def composite_images(image_paths: list, output_path: str = None,
-                      draw_labels: bool = True) -> str:
-    """
-    将多张参考图合成一张组合图（最多 6 张）。
+# 瞬时性 HTTP 错误：值得等一小会儿重试，而不是直接判失败换供应商
+# （429=限流、500/502/503=服务端瞬时错误/网关过载，中转站高并发下常见，稍等重试往往能成功）
+_RETRYABLE_HTTP_STATUS = {429, 500, 502, 503}
 
-    布局规则：
-      - 1 张：原图返回
-      - 2 张：左右并排（2 列 × 1 行）
-      - 3~4 张：2×2 网格（3 张时最后一行居中）
-      - 5~6 张：3×2 网格（5 张时最后一行居中）
+# 网络层异常（代理断连 / 连接中断）的重试等待：最多重试 2 次，等待时间递增。
+# 隧道抖动通常持续几秒，等 1 秒往往不够恢复，退避能给足自愈时间。
+_NETWORK_RETRY_DELAYS = (1.0, 3.0)
 
-    每张图统一 resize 为 512×512，2px 间隔，白色背景填充。
-    draw_labels=True 时绘制"图1/图2..."红底白字角标。
-    """
-    if not HAS_PIL:
-        raise RuntimeError("需要安装 Pillow: pip install Pillow")
-    from PIL import ImageDraw
 
-    paths = [p for p in image_paths if p and os.path.isfile(p)]
-    if not paths:
-        raise FileNotFoundError("没有有效的参考图")
-    if len(paths) == 1:
-        return paths[0]
-
-    CELL = 512
-    GAP = 2
-    BG_COLOR = (255, 255, 255)
-
-    label_font = _try_load_font(28) if draw_labels else None
-
-    def _paste_with_label(canvas, img, box, idx):
-        """贴图 + 画图位角标"""
-        canvas.paste(img, box)
-        if draw_labels:
-            try:
-                draw = ImageDraw.Draw(canvas)
-                label = f"图{idx + 1}"
-                pad_x, pad_y = 12, 8
-                try:
-                    tb = draw.textbbox((0, 0), label, font=label_font)
-                    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-                except AttributeError:
-                    tw, th = draw.textsize(label, font=label_font)
-                rx0, ry0 = box[0] + 6, box[1] + 6
-                rx1, ry1 = rx0 + tw + pad_x * 2, ry0 + th + pad_y * 2
-                draw.rectangle([rx0, ry0, rx1, ry1], fill=(220, 38, 38))
-                draw.text((rx0 + pad_x, ry0 + pad_y - 2), label,
-                          fill=(255, 255, 255), font=label_font)
-            except Exception:
-                pass
-
-    count = len(paths)
-    if count == 2:
-        cols, rows = 2, 1
-    elif count <= 4:
-        cols, rows = 2, 2
-    else:
-        cols, rows = 3, 2
-
-    w = CELL * cols + GAP * (cols - 1)
-    h = CELL * rows + GAP * (rows - 1)
-    canvas = Image.new("RGB", (w, h), BG_COLOR)
-
-    # 最后一行不满时水平居中，避免右侧留空
-    last_row_start = (count - 1) // cols * cols
-    last_row_count = count - last_row_start
-    row_w = last_row_count * CELL + GAP * (last_row_count - 1)
-    row_start_x = (w - row_w) // 2 if last_row_count < cols else 0
-
-    for i, p in enumerate(paths):
-        img = Image.open(p).convert("RGB").resize((CELL, CELL), Image.LANCZOS)
-        row, col = divmod(i, cols)
-        if i < last_row_start:
-            x = col * (CELL + GAP)
-        else:
-            x = row_start_x + (i - last_row_start) * (CELL + GAP)
-        y = row * (CELL + GAP)
-        _paste_with_label(canvas, img, (x, y), i)
-
-    output_path = output_path or tempfile.mktemp(suffix=".png")
-    canvas.save(output_path, "PNG")
-    return output_path
 
 
 # ============================================================
 # API 调用
 # ============================================================
+# 每线程复用一个 Session（连接池）：走隧道时避免每次调用重复
+# TCP+TLS 握手，单次请求省 1~2 秒，并发吞吐明显提升
+_session_local = threading.local()
+
+
+def _get_session() -> "requests.Session":
+    session = getattr(_session_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _session_local.session = session
+    return session
+
+
 def call_text_to_image(provider: dict, prompt: str, size: str, n: int,
                         response_format: str = "url") -> tuple:
     """
@@ -359,9 +286,96 @@ def call_text_to_image(provider: dict, prompt: str, size: str, n: int,
 
     url = f"{provider['base_url']}/v1/images/generations"
     headers = {"Authorization": f"Bearer {provider['api_key']}"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+    resp = _get_session().post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
     return resp.json(), response_format
+
+
+# ============================================================
+# 参考图上传压缩（第一优先：AI 能看清参考图细节，如衣服上的文字）
+# ============================================================
+# 只减体积不减清晰度：最长边 1536 + JPEG 质量 90 + 缩放后轻微锐化，
+# PNG 图无损保留。参数可用环境变量调整（如文字看不清可提到 2048/95）
+REF_IMAGE_MAX_EDGE = int(os.getenv("REF_IMAGE_MAX_EDGE", "1536"))
+REF_IMAGE_JPEG_QUALITY = int(os.getenv("REF_IMAGE_JPEG_QUALITY", "90"))
+_PNG_KEEP_MAX_BYTES = 1536 * 1024  # PNG 缩放后不超过该体积则保留 PNG（无损，文字最锐）
+
+
+def prepare_reference_image(img_path: str) -> tuple:
+    """把参考图压成适合上传的 (bytes, mime, filename)。
+
+    规则：
+    - 只缩不放：原图最长边 <= REF_IMAGE_MAX_EDGE 时保持原尺寸
+    - 缩放后做轻微锐化（UnsharpMask），弥补缩图导致的文字边缘发软
+    - 原图是 PNG 且压缩后体积不大（<=1.5MB）时保留 PNG（无损）
+    - 其余转 JPEG 质量 REF_IMAGE_JPEG_QUALITY（透明通道铺白底）
+    - 压缩结果比原图还大时直接用原图字节（保证只减不增）
+    PIL 不可用或解析失败时原样返回文件原始字节。
+    """
+    fname = os.path.basename(img_path)
+    with open(img_path, "rb") as f:
+        raw = f.read()
+
+    if not HAS_PIL:
+        mime = mimetypes.guess_type(img_path)[0] or "application/octet-stream"
+        return raw, mime, fname
+
+    from PIL import Image, ImageOps, ImageFilter
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        mime = mimetypes.guess_type(img_path)[0] or "application/octet-stream"
+        return raw, mime, fname
+
+    # 按 EXIF 方向摆正（手机拍摄的照片常见旋转标记）
+    img = ImageOps.exif_transpose(img)
+    is_png = (img.format == "PNG") or fname.lower().endswith(".png")
+
+    # 只缩不放
+    w, h = img.size
+    if max(w, h) > REF_IMAGE_MAX_EDGE:
+        scale = REF_IMAGE_MAX_EDGE / max(w, h)
+        img = img.resize(
+            (max(1, round(w * scale)), max(1, round(h * scale))),
+            Image.LANCZOS,
+        )
+        # 轻微锐化，把缩图后发软的文字边缘"提"回来
+        try:
+            img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=80, threshold=2))
+        except Exception:
+            pass
+
+    stem = os.path.splitext(fname)[0] or "image"
+
+    # PNG 优先无损保留（文字/线条最锐）
+    if is_png:
+        try:
+            buf = io.BytesIO()
+            img.save(buf, "PNG", optimize=True)
+            data = buf.getvalue()
+            if len(data) <= _PNG_KEEP_MAX_BYTES:
+                return data, "image/png", stem + ".png"
+        except Exception:
+            pass
+
+    # 转 JPEG（透明通道铺白底，避免黑底）
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=REF_IMAGE_JPEG_QUALITY, optimize=True)
+    data = buf.getvalue()
+    if len(data) >= len(raw):
+        # 压缩反而更大（本身就很小的图）：直接用原图
+        mime = mimetypes.guess_type(img_path)[0] or "image/jpeg"
+        return raw, mime, fname
+    return data, "image/jpeg", stem + ".jpg"
 
 
 def call_image_edit(provider: dict, prompt: str, reference_images: list, n: int,
@@ -376,7 +390,7 @@ def call_image_edit(provider: dict, prompt: str, reference_images: list, n: int,
     """
     for img_path in reference_images:
         if not os.path.isfile(img_path):
-            raise FileNotFoundError(f"参考图文件不存在: {img_path}")
+            raise FileNotFoundError(f"参考图已失效，请重新上传：{img_path}")
 
     url = f"{provider['base_url']}/v1/images/edits"
 
@@ -390,15 +404,14 @@ def call_image_edit(provider: dict, prompt: str, reference_images: list, n: int,
     if size:
         file_fields.append(("size", (None, size)))
     for img_path in reference_images:
-        with open(img_path, "rb") as f:
-            img_data = f.read()
-        mime = mimetypes.guess_type(img_path)[0] or "image/png"
+        # 上传前压缩参考图（保留文字细节的前提下削减体积，降低带宽/隧道压力）
+        img_bytes, mime, fname = prepare_reference_image(img_path)
         file_fields.append(
-            ("image", (os.path.basename(img_path), img_data, mime))
+            ("image", (fname, img_bytes, mime))
         )
 
     headers = {"Authorization": f"Bearer {provider['api_key']}"}
-    resp = requests.post(
+    resp = _get_session().post(
         url,
         headers=headers,
         files=file_fields,
@@ -450,8 +463,9 @@ def process_single_task(prompt: str, reference_images: list,
     # 多 API 自动切换：依次尝试所有匹配线路的供应商，哪个成功就用哪个（并记住它）
     errors = []
     for provider in _get_provider_order(change):
-        # 网络层异常（代理断连等）自动重试 1 次：中转站波动时第二次往往能拿到真实业务响应
-        for attempt in range(2):
+        # 网络层异常（代理断连等）按 _NETWORK_RETRY_DELAYS 退避重试：
+        # 隧道抖动持续几秒时，多给几次机会往往能拿到真实业务响应
+        for attempt in range(len(_NETWORK_RETRY_DELAYS) + 1):
             try:
                 if is_edit:
                     resp_data, _ = call_image_edit(provider, prompt, refs, n, size, response_format)
@@ -478,34 +492,51 @@ def process_single_task(prompt: str, reference_images: list,
                 return result
 
             except requests.exceptions.ProxyError:
-                if attempt == 0:
-                    time.sleep(1)  # 隧道/中转站波动，稍等后重试一次
+                if attempt < len(_NETWORK_RETRY_DELAYS):
+                    time.sleep(_NETWORK_RETRY_DELAYS[attempt])  # 隧道波动，退避后重试
                     continue
-                errors.append(f"[{provider['name']}] 代理连接异常，请检查 frp 代理链路或稍后重试")
+                errors.append(f"[{_provider_tag(provider)}] 代理连接异常，请检查 frp 代理链路或稍后重试")
                 _forget_provider_if_matched(provider["name"])
                 break
             except requests.exceptions.ConnectionError:
-                if attempt == 0:
-                    time.sleep(1)
+                if attempt < len(_NETWORK_RETRY_DELAYS):
+                    time.sleep(_NETWORK_RETRY_DELAYS[attempt])
                     continue
-                errors.append(f"[{provider['name']}] 网络连接中断，请稍后重试")
+                errors.append(f"[{_provider_tag(provider)}] 网络连接中断，请稍后重试")
                 _forget_provider_if_matched(provider["name"])
                 break
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code if hasattr(e, "response") and e.response is not None else 0
-                errors.append(f"[{provider['name']}] {_http_error_desc(status_code)}")
+                if status_code in _RETRYABLE_HTTP_STATUS and attempt == 0:
+                    # 瞬时性错误（限流/网关过载）：优先按 Retry-After 等待，缺省等 2 秒后重试一次
+                    retry_after = 2.0
+                    try:
+                        ra = e.response.headers.get("Retry-After")
+                        if ra and ra.isdigit():
+                            retry_after = min(float(ra), 10.0)
+                    except Exception:
+                        pass
+                    time.sleep(retry_after)
+                    continue
+                errors.append(f"[{_provider_tag(provider)}] {_http_error_desc(status_code)}")
                 _forget_provider_if_matched(provider["name"])
                 break
             except requests.exceptions.Timeout:
-                errors.append(f"[{provider['name']}] 请求超时")
+                errors.append(f"[{_provider_tag(provider)}] 请求超时")
                 _forget_provider_if_matched(provider["name"])
                 break
             except requests.exceptions.RequestException as e:
-                errors.append(f"[{provider['name']}] 网络错误: {str(e)}")
+                errors.append(f"[{_provider_tag(provider)}] 网络错误: {str(e)}")
                 _forget_provider_if_matched(provider["name"])
                 break
+            except FileNotFoundError as e:
+                # 本地参考图缺失（非供应商故障）：所有供应商都会同样失败，直接返回，
+                # 不套供应商前缀也不切换线路，避免错误信息重复、误导排查方向
+                result["status"] = "failed"
+                result["error"] = str(e)
+                return result
             except Exception as e:
-                errors.append(f"[{provider['name']}] {str(e)}")
+                errors.append(f"[{_provider_tag(provider)}] {str(e)}")
                 _forget_provider_if_matched(provider["name"])
                 break
 

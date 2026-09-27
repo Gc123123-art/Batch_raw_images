@@ -928,6 +928,8 @@
     });
 
     // ========== 提交生成 ==========
+    // 生成中标记：会话结束时若任务仍在跑则不删参考图，避免任务重试/恢复时缺图
+    let generating = false;
     createForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const prompt = document.getElementById('prompt').value.trim();
@@ -940,6 +942,7 @@
       if (balance <= 0) { toast('余额不足，请联系管理员充值', 'error'); return; }
 
       submitBtn.disabled = true;
+      generating = true;
       const originalText = submitBtn.innerHTML;
       submitBtn.innerHTML = '<div class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;"></div> 生成中…';
       showPreviewLoading();
@@ -983,6 +986,7 @@
         toast(err.message, 'error');
         showPreviewEmpty();
       } finally {
+        generating = false;
         submitBtn.disabled = false;
         submitBtn.innerHTML = originalText;
       }
@@ -1048,6 +1052,8 @@
     // ========== 会话结束：删除本次会话的参考图 ==========
     // 刷新 / 关闭页面时，当前参考图不再使用，立即通知后端删除文件（keepalive 保证请求发出）
     window.addEventListener('beforeunload', () => {
+      // 生成中不删图：任务可能仍需要这些参考图（后端也会二次校验并退款兜底）
+      if (generating) return;
       // 批量图 + 参考图（批量模式下为共用参考图）都清理
       const paths = [...(batchSource ? batchSource.paths : []), ...refItems.map(it => it.path)];
       (paths || []).forEach(p => {
