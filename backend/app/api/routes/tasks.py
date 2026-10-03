@@ -8,6 +8,7 @@
 """
 
 import os
+import math
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -65,6 +66,51 @@ RATIO_HINTS = {
 def _resolve_size(size: str) -> str:
     """把前端比例 / 旧像素值解析为平台请求 size"""
     return SIZE_MAP.get(size, size)  # 未知值原样传给平台
+
+
+# 自动比例：候选与前端下拉支持的 7 种比例一致（每种都对应平台三种标准尺寸之一）
+AUTO_RATIO_CANDIDATES = tuple(RATIO_HINTS.keys())
+
+
+def _ratio_float(key: str) -> float:
+    """比例字符串 -> 宽高比数值，如 "3:4" -> 0.75"""
+    w, h = key.split(":")
+    return float(w) / float(h)
+
+
+def _auto_ratio_from_image(path: str):
+    """读取参考图实际宽高，返回最接近的支持比例（如 "3:4"）；读取失败返回 None
+
+    必须按 EXIF 摆正后再取宽高：手机竖拍照片常以横置像素 + EXIF Orientation 存储，
+    直接读 im.size 会把 3:4 竖图误判成 4:3 横图。
+    """
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(path) as im:
+            fixed = ImageOps.exif_transpose(im) or im
+            width, height = fixed.size
+    except Exception:
+        return None
+    if not width or not height:
+        return None
+    # 对数空间比较：1:2 与 2:1 相对 1:1 的偏离程度应相同
+    target = math.log(width / height)
+    return min(AUTO_RATIO_CANDIDATES,
+               key=lambda k: abs(math.log(_ratio_float(k)) - target))
+
+
+def _resolve_ratio(size: str, refs: list) -> tuple:
+    """把前端尺寸选择解析为 (平台请求 size, 追加进提示词的比例提示)。
+
+    auto：按第一张参考图的实际宽高比映射到最近的标准尺寸与比例提示；
+    无参考图（纯文生图）时无依据，退回 1:1。
+    """
+    if size == "auto":
+        ratio_key = _auto_ratio_from_image(refs[0]) if refs else None
+        if not ratio_key:
+            ratio_key = "1:1"
+        return SIZE_MAP[ratio_key], RATIO_HINTS[ratio_key]
+    return _resolve_size(size), RATIO_HINTS.get(size, "")
 
 
 def _user_id_by_account(account: str):
@@ -151,14 +197,6 @@ def _run_task_background(account: str, created_at: str, prompt: str,
         # 子任务总数：批量模式 = 批量图数量，否则 = n
         seq_count = len(ref_list) if (batch and ref_list) else n
 
-        # 尺寸映射：前端比例 -> 平台标准 size
-        platform_size = _resolve_size(size)
-
-        # 所有比例：把"图片比例：X:Y"追加进提示词末尾（逗号衔接、句号收尾），与 size 参数双重保险
-        gen_prompt = prompt
-        if size in RATIO_HINTS:
-            gen_prompt = f"{prompt}，{RATIO_HINTS[size]}。"
-
         # 恢复场景：跳过已成功的子任务，避免重复调用 AI 重复扣供应商费用
         done_seqs = {r["seq"] for r in get_task_results(account, created_at)}
 
@@ -172,6 +210,10 @@ def _run_task_background(account: str, created_at: str, prompt: str,
             # 批量模式：每个子任务用对应的 1 张批量图 + 全部共用参考图；
             # 普通模式：所有参考图一起送模型
             refs_for_seq = ([ref_list[seq - 1]] if (batch and ref_list) else list(ref_list)) + shared_list
+            # 尺寸映射：auto 按第一张参考图比例映射到最近标准尺寸；固定比例直接映射。
+            # 比例提示追加进提示词末尾（逗号衔接、句号收尾），与 size 参数双重保险
+            platform_size, ratio_hint = _resolve_ratio(size, refs_for_seq)
+            gen_prompt = f"{prompt}，{ratio_hint}。" if ratio_hint else prompt
             # 全局并发闸门：等待拿到额度后才发起 AI 调用
             with _gen_semaphore:
                 result = process_single_task(
@@ -320,9 +362,9 @@ def create_batch_task(req: TaskCreateRequest, user: dict = current_user):
         raise HTTPException(status_code=400, detail="prompt 不能为空")
     if not req.size:
         raise HTTPException(status_code=400, detail="比例 size 必传（由前端选择）")
-    if req.size not in SIZE_MAP:
+    if req.size != "auto" and req.size not in SIZE_MAP:
         raise HTTPException(status_code=400,
-                            detail="不支持的尺寸，仅支持 1:1 / 3:4 / 4:3 / 9:16 / 16:9 / 2:3 / 3:2")
+                            detail="不支持的尺寸，仅支持 auto / 1:1 / 3:4 / 4:3 / 9:16 / 16:9 / 2:3 / 3:2")
     if not req.n or req.n < 1:
         raise HTTPException(status_code=400, detail="张数 n 必传且 >= 1")
 

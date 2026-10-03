@@ -329,7 +329,7 @@
             ? `批量 ${refCount} 张 + 共用 ${sharedCount} 张`
             : (task.batch ? `批量 ${refCount} 张` : `${refCount} 张`))
         : '无';
-      sizeEl.textContent = task.size;
+      sizeEl.textContent = task.size === 'auto' ? '自动（跟随原图）' : task.size;
       nEl.textContent = (task.completed_count || 0) + ' 张';
       statusEl.className = `status-badge status-${task.status}`;
       statusEl.textContent = statusText(task.status);
