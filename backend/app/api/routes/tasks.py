@@ -26,7 +26,9 @@ from app.db.database import (
     list_incomplete_tasks, list_stalled_running_tasks,
 )
 from app.api.deps import current_user
-from app.services.engine import process_single_task
+from app.services.engine import (
+    process_single_task, pick_task_provider, release_task_provider,
+)
 
 router = APIRouter(tags=["task"])
 
@@ -168,6 +170,7 @@ def _run_task_background(account: str, created_at: str, prompt: str,
     否则（默认）：所有参考图合成后生成 n 张（n 仅在本次执行期间使用，不入库）。
     """
     seq_count = 0
+    task_pin = None
     try:
         # 用户线路分组：任务执行期间固定，与供应商 change 匹配
         user_change = _user_change(account)
@@ -205,6 +208,10 @@ def _run_task_background(account: str, created_at: str, prompt: str,
         pending_seqs = [seq for seq in range(1, seq_count + 1) if seq not in done_seqs]
         completed += (seq_count - len(pending_seqs))
 
+        # 任务级锁定线路：整个任务只挑一条线，多张图走同一条，避免混用不同模型；
+        # 不同任务之间仍按"最少在途"分散。该线中途失败仍会换线重试。
+        task_pin = pick_task_provider(user_change)
+
         def _generate_one(seq: int):
             nonlocal completed
             # 批量模式：每个子任务用对应的 1 张批量图 + 全部共用参考图；
@@ -222,6 +229,7 @@ def _run_task_background(account: str, created_at: str, prompt: str,
                     size=platform_size,
                     n=1,
                     change=user_change,
+                    pin_provider=task_pin,
                 )
 
             if result["status"] == "success":
@@ -259,6 +267,9 @@ def _run_task_background(account: str, created_at: str, prompt: str,
             update_task_status(account, created_at, "failed")
         except Exception:
             pass
+    finally:
+        # 释放任务级线路占用，避免线路被永久"锁定"
+        release_task_provider(task_pin)
     # 参考图由前端负责删除：参考图被移除 / 会话结束时调用 DELETE /api/upload 立即删除
 
 
